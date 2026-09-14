@@ -27,6 +27,15 @@ smoke: build
 faults: build
     python3 tests/acme_faults.py "${CARGO_TARGET_DIR:-target}/debug/geata"
 
+demo *args:
+    python3 examples/traffic-demo/demo.py {{args}}
+
+demo-check binary="result/bin/geata":
+    python3 examples/traffic-demo/check.py "$1"
+
+cashu:
+    cargo test --locked --workspace --test cashu
+
 rate-limits: build
     python3 tests/rate_limits.py "${CARGO_TARGET_DIR:-target}/debug/geata"
 

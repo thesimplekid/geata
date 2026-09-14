@@ -2,6 +2,7 @@ mod acme_http;
 mod automation;
 mod certificates;
 mod config;
+mod payments;
 mod proxy;
 mod rate_limit;
 mod retry;
@@ -37,6 +38,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage collected Cashu funds and payouts. Stop the proxy first.
+    Wallet {
+        #[arg(long)]
+        mint: String,
+        #[arg(long, env = "PROXY_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        action: WalletAction,
+    },
     /// Serve sites and automatically reload valid Geatafile edits.
     Run {
         #[arg(short, long, default_value = "Geatafile")]
@@ -68,6 +78,33 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum WalletAction {
+    /// Pay a Cashu payment request using collected sats.
+    Pay {
+        request: String,
+        #[arg(long)]
+        amount: Option<u64>,
+        /// Maximum wallet debit including every fee, in sats.
+        #[arg(long)]
+        max_total: u64,
+    },
+    /// Inspect unclaimed sends and resolve completed payout recovery guards.
+    Pending,
+    /// Reclaim an unclaimed send by operation ID (mint fees may apply).
+    Reclaim {
+        #[arg(long)]
+        operation: String,
+    },
+    /// Show the spendable balance in sats.
+    Balance,
+    /// Export sats as a bearer Cashu token. Keep stdout private.
+    Export {
+        #[arg(long)]
+        amount: u64,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -75,6 +112,48 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     match Cli::parse().command {
+        Command::Wallet {
+            mint,
+            data_dir,
+            action,
+        } => {
+            let mint = payments::parse_mint(&mint)?;
+            let data_dir = data_dir.map(Ok).unwrap_or_else(default_data_dir)?;
+            let _lock = Storage::open(&data_dir, "geata-cashu-wallet")?;
+            let wallet = payments::Payments::new(&data_dir);
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(async {
+                match action {
+                    WalletAction::Pay {
+                        request,
+                        amount,
+                        max_total,
+                    } => {
+                        wallet.pay(&mint, &request, amount, max_total).await?;
+                        println!("Payout delivered");
+                    }
+                    WalletAction::Pending | WalletAction::Reclaim { .. } => {
+                        let reclaim = match &action {
+                            WalletAction::Reclaim { operation } => Some(operation.as_str()),
+                            _ => None,
+                        };
+                        let pending = wallet.pending(&mint, reclaim).await?;
+                        if pending.is_empty() {
+                            println!("No pending sends");
+                        }
+                        for line in pending {
+                            println!("{line}");
+                        }
+                    }
+                    WalletAction::Balance => println!("{} sat", wallet.balance(&mint).await?),
+                    WalletAction::Export { amount } => {
+                        ensure!(amount > 0, "export amount must be positive");
+                        println!("{}", wallet.export(&mint, amount).await?);
+                    }
+                }
+                anyhow::Ok(())
+            })?;
+        }
         Command::Validate { config } => {
             let parsed = Config::read(&config)?;
             println!(
@@ -122,7 +201,9 @@ fn main() -> anyhow::Result<()> {
                 "ACME directory must be an HTTPS URL"
             );
             let storage = Arc::new(Storage::open(&data_dir, &directory_url)?);
-            let state = Arc::new(State::new(parsed));
+            let mut state = State::new(parsed);
+            state.payments = Some(Arc::new(payments::Payments::new(&data_dir)));
+            let state = Arc::new(state);
             // Populate before accepting connections, so restart reuses certificates immediately.
             for domain in state.config.load().https_domains() {
                 if let Some(cert) = storage.certificate(domain) {

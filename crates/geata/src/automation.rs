@@ -39,11 +39,38 @@ impl BackgroundService for Automation {
             _ = shutdown.changed() => {},
             _ = self.watch_config() => {},
             _ = self.manage_certificates() => {},
+            _ = self.manage_payouts() => {},
         }
     }
 }
 
 impl Automation {
+    async fn manage_payouts(&self) {
+        loop {
+            if let Some(payments) = &self.state.payments {
+                let policies = self.state.config.load().payouts.clone();
+                for policy in policies {
+                    // Reloads can remove a policy while a different mint is busy.
+                    if !self.state.config.load().payouts.contains(&policy) {
+                        continue;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        payments.automatic_payout(&policy),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        _ => {
+                            tracing::warn!(mint = %policy.mint, "automatic payout failed or timed out; inspect wallet pending before retrying uncertain deliveries")
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
     async fn watch_config(&self) {
         let mut previous = self.initial_config.clone();
         loop {

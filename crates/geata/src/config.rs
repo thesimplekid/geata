@@ -3,7 +3,11 @@ use std::{collections::BTreeMap, net::IpAddr, path::Path, sync::Arc};
 use thiserror::Error;
 use url::Url;
 
-use crate::rate_limit::{Limit, RateLimiter};
+use crate::{
+    payments::PaymentPolicy,
+    rate_limit::{Limit, RateLimiter},
+};
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Error)]
 #[error("Geatafile line {line}: {message}")]
@@ -26,6 +30,14 @@ pub struct Site {
     pub https: bool,
     pub handler: Handler,
     pub rate_limit: Option<Arc<RateLimiter>>,
+    pub payment: Option<PaymentPolicy>,
+    pub capacity: Option<Capacity>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Capacity {
+    pub max: u32,
+    pub permits: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +49,7 @@ pub enum Handler {
 #[derive(Debug)]
 pub struct Config {
     pub sites: BTreeMap<String, Site>,
+    pub payouts: Vec<crate::payments::payout::PayoutPolicy>,
 }
 
 impl Config {
@@ -59,6 +72,7 @@ impl Config {
         }
         let tokens = tokenize(input)?;
         let mut sites = BTreeMap::new();
+        let mut payouts = Vec::new();
         let mut cursor = 0;
         while cursor < tokens.len() {
             let line = tokens[cursor].line;
@@ -71,7 +85,7 @@ impl Config {
                 .or_else(|| address.strip_prefix("https://"))
                 .unwrap_or(address)
                 .to_ascii_lowercase();
-            if !valid_domain(&domain, https) {
+            if address != "cashu_payout" && !valid_domain(&domain, https) {
                 return Err(error(
                     line,
                     "expected a domain (e.g. example.com); use http://localhost for local HTTP. Wildcards, local HTTPS, and site ports are not supported yet",
@@ -97,12 +111,42 @@ impl Config {
             {
                 return Err(error(line, "expected '}' after site directives"));
             }
-            let (handler, rate_limit) = parse_directives(&tokens[start..cursor], line)?;
+            if address == "cashu_payout" {
+                let args: Vec<_> = tokens[start..cursor]
+                    .iter()
+                    .filter_map(Token::text)
+                    .collect();
+                let payout = crate::payments::payout::PayoutPolicy::parse(&args)
+                    .map_err(|e| error(line, &e.to_string()))?;
+                if payouts
+                    .iter()
+                    .any(|p: &crate::payments::payout::PayoutPolicy| p.mint == payout.mint)
+                {
+                    return Err(error(line, "duplicate payout mint"));
+                }
+                if payouts.len() >= 16 {
+                    return Err(error(line, "at most 16 payout mints are supported"));
+                }
+                payouts.push(payout);
+                cursor += 1;
+                continue;
+            }
+            let (handler, rate_limit, payment, max_inflight) =
+                parse_directives(&tokens[start..cursor], line)?;
+            if payment.is_some() && rate_limit.is_none() {
+                return Err(error(line, "pay_over_limit requires rate_limit"));
+            }
+            let max_inflight = max_inflight.or_else(|| payment.as_ref().map(|_| 128));
             let site = Site {
                 domain: domain.clone(),
                 https,
                 handler,
                 rate_limit: rate_limit.map(|limit| Arc::new(RateLimiter::new(limit))),
+                payment,
+                capacity: max_inflight.map(|max| Capacity {
+                    max,
+                    permits: Arc::new(Semaphore::new(max as usize)),
+                }),
             };
             if sites.insert(domain.clone(), site).is_some() {
                 return Err(error(line, &format!("duplicate site {domain}")));
@@ -115,7 +159,7 @@ impl Config {
                 "add at least one site: example.com { reverse_proxy localhost:3000 }",
             ));
         }
-        Ok(Self { sites })
+        Ok(Self { sites, payouts })
     }
 
     pub fn https_domains(&self) -> impl Iterator<Item = &str> {
@@ -126,26 +170,34 @@ impl Config {
     }
 }
 
-fn parse_directives(
-    tokens: &[Token],
-    line: usize,
-) -> Result<(Handler, Option<Limit>), ConfigError> {
+type ParsedDirectives = (Handler, Option<Limit>, Option<PaymentPolicy>, Option<u32>);
+
+fn parse_directives(tokens: &[Token], line: usize) -> Result<ParsedDirectives, ConfigError> {
     let mut handler = None;
     let mut rate_limit = None;
+    let mut payment = None;
+    let mut max_inflight = None;
     let mut cursor = 0;
     while cursor < tokens.len() {
         let start = cursor;
         let line = tokens[start].line;
         let count = match tokens[start].text() {
             Some("reverse_proxy") => 2,
-            Some("rate_limit") => 4,
+            Some("rate_limit" | "pay_over_limit") => 4,
+            Some("max_inflight") => 2,
             Some("respond") => {
                 // The body is mandatory; a following directive cannot be its status.
                 let status = tokens.get(start + 2).is_some_and(|token| {
                     token.quoted
                         || !matches!(
                             token.text(),
-                            Some("rate_limit" | "respond" | "reverse_proxy")
+                            Some(
+                                "rate_limit"
+                                    | "pay_over_limit"
+                                    | "max_inflight"
+                                    | "respond"
+                                    | "reverse_proxy"
+                            )
                         )
                 });
                 2 + usize::from(status)
@@ -159,6 +211,35 @@ fn parse_directives(
             message: message.to_owned(),
         };
         match args[0].text() {
+            Some("pay_over_limit") => {
+                if payment.is_some() {
+                    return Err(error("duplicate pay_over_limit directive"));
+                }
+                if args.len() != 4 {
+                    return Err(error("expected pay_over_limit <price> sat <mint URL>"));
+                }
+                payment = Some(
+                    PaymentPolicy::parse(
+                        args[1].text().unwrap_or_default(),
+                        args[2].text().unwrap_or_default(),
+                        args[3].text().unwrap_or_default(),
+                    )
+                    .map_err(|e| error(&e.to_string()))?,
+                );
+            }
+            Some("max_inflight") => {
+                if max_inflight.is_some() {
+                    return Err(error("duplicate max_inflight directive"));
+                }
+                max_inflight = args
+                    .get(1)
+                    .and_then(Token::text)
+                    .and_then(|text| text.parse::<u32>().ok())
+                    .filter(|max| (1..=1_000_000).contains(max));
+                if max_inflight.is_none() {
+                    return Err(error("max_inflight must be between 1 and 1000000"));
+                }
+            }
             Some("rate_limit") => {
                 if rate_limit.is_some() {
                     return Err(error("duplicate rate_limit directive"));
@@ -200,7 +281,7 @@ fn parse_directives(
             }
             _ => {
                 return Err(error(
-                    "unknown directive; expected reverse_proxy, respond, or rate_limit",
+                    "unknown directive; expected reverse_proxy, respond, rate_limit, pay_over_limit, or max_inflight",
                 ));
             }
         }
@@ -209,7 +290,7 @@ fn parse_directives(
         line,
         message: "expected exactly one reverse_proxy or respond directive per site".to_owned(),
     })?;
-    Ok((handler, rate_limit))
+    Ok((handler, rate_limit, payment, max_inflight))
 }
 
 struct Token {
@@ -517,6 +598,31 @@ mod tests {
         assert!(
             Config::parse("http://localhost { respond ok\nreverse_proxy localhost:3000 }").is_err()
         );
+    }
+
+    #[test]
+    fn paid_sites_require_a_free_allowance_and_have_a_capacity_cap() -> anyhow::Result<()> {
+        let config = Config::parse(
+            "http://localhost { respond ok pay_over_limit 2 sat https://mint.example.com rate_limit 1/s burst 2 }",
+        )?;
+        let site = &config.sites["localhost"];
+        assert_eq!(site.payment.as_ref().expect("payment").price, 2);
+        assert_eq!(site.capacity.as_ref().expect("capacity").max, 128);
+        for body in [
+            "respond ok pay_over_limit 2 sat https://mint.example.com",
+            "respond ok rate_limit 1/s burst 2 pay_over_limit 0 sat https://mint.example.com",
+            "respond ok rate_limit 1/s burst 2 pay_over_limit 2 usd https://mint.example.com",
+            "respond ok max_inflight 0",
+            "respond ok max_inflight 1000001",
+            "respond ok max_inflight 1 max_inflight 2",
+            "respond ok rate_limit 1/s burst 2 pay_over_limit 2 sat https://mint.example.com pay_over_limit 3 sat https://mint.example.com",
+        ] {
+            assert!(
+                Config::parse(&format!("http://localhost {{ {body} }}")).is_err(),
+                "accepted {body}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

@@ -11,6 +11,10 @@ name = "geata"
 path = "src/main.rs"
 
 [dependencies]
+cdk.workspace = true
+cdk-sqlite.workspace = true
+redb.workspace = true
+rusqlite.workspace = true
 anyhow.workspace = true
 arc-swap.workspace = true
 async-trait.workspace = true
@@ -22,6 +26,7 @@ httpdate.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
 instant-acme.workspace = true
+nostr-sdk.workspace = true
 openssl.workspace = true
 parking_lot.workspace = true
 pingora.workspace = true
@@ -35,6 +40,9 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+tungstenite.workspace = true
 
 [lints]
 workspace = true

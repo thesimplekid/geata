@@ -37,10 +37,23 @@ For HTTP-only checks, use `just smoke`. For focused tests, use:
 just regressions  # retry safety, config symlinks/defaults, CA URL validation, staging reuse
 just faults       # stalled orders and persistent CA rate limits; no Pebble needed
 just rate-limits  # visitor limits, backend protection, TLS, and reloads
+just cashu        # real CDK payments against a local mint protocol fixture
 ```
 
 The scripts share socket, process, and private TLS fixtures in `tests/support.py`.
-The full integration run includes all three focused suites.
+The HTTP/Pebble integration run includes the three Python suites. The Cashu
+executable test lives in `crates/geata/tests/cashu.rs` and runs with `cargo test`,
+`just quick-check`, and the Nix test/package checks. It uses CDK's cryptography
+against a local mint protocol fixture; no public mint or real money is needed.
+It tests free/paid admission, input fees, DLEQ verification, spent and reused
+tokens, capacity before redemption, header stripping, mint outages, lost swap
+responses, restart recovery, and wallet balance/export commands. Payout tests cover HTTP and encrypted Nostr delivery through a local relay, fee
+caps, interval/threshold scheduling, persisted uncertainty, and reclaiming sends.
+
+Payments use CDK's wallet and Nostr features and its SQLite wallet backend. Geata's
+separate redb admission journal uses immediate durable commits before dispatch.
+Treat the wallet seed, wallet database, and admission journal as one backup unit.
+Changes here must preserve replay prevention and interrupted-redemption recovery.
 
 Public staging issuance is an opt-in test, separate from the reproducible local
 gate. It requires a domain whose public DNS points to this machine, reachable
@@ -86,11 +99,8 @@ nix develop path:.
 No shell hook changes global state or creates databases. The integration script
 creates private temporary directories, stops its own processes, and cleans up.
 
-The explicit `path:.` also works before repository initialization. This workspace
-initially contained an empty, read-only `.git` placeholder, not valid Git or JJ
-metadata; no repository history has been created or changed.
-
 When changing configuration or CLI options, update their validation, examples,
-help, and README together. Changes to certificate persistence must preserve
+help, and the relevant guides in `docs/` together. Keep the README focused on
+the overview and quick start. Changes to certificate persistence must preserve
 private permissions and atomic certificate/key replacement. Never log private
 keys, ACME account credentials, or challenge responses.

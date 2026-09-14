@@ -52,6 +52,10 @@
             '';
             clippy = craneLib.cargoClippy (args // { cargoClippyExtraArgs = "--all-targets -- -D warnings"; });
             tests = craneLib.cargoTest args;
+            demo = pkgs.runCommand "geata-demo-check" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+              python3 ${./examples/traffic-demo}/check.py ${package}/bin/geata
+              touch $out
+            '';
             integration =
               pkgs.runCommand "geata-integration"
                 {

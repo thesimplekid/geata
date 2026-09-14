@@ -1,0 +1,79 @@
+# Configuration
+
+Each site has exactly one `reverse_proxy` or `respond` directive, with optional
+`rate_limit`, `pay_over_limit`, and `max_inflight` settings. Braces can
+appear on one line or multiple lines. Blank lines and `#` comments outside quoted
+strings are supported.
+
+```caddyfile
+example.com {
+    reverse_proxy localhost:3000
+}
+
+api.example.com {
+    reverse_proxy https://backend.example.net:8443
+}
+
+http://localhost {
+    respond "Hello world!"
+}
+```
+
+## Direct responses
+
+To serve a response directly over automatic HTTPS:
+
+```caddyfile
+hello.example.com {
+    respond "Hello world!"
+}
+```
+
+Replace the domain with your own and run the proxy as usual. `respond` returns
+the configured text directly, with status 200 and content type
+`text/plain; charset=utf-8`. It uses the same certificate automation and HTTP
+redirects as proxied sites. No extra server is needed.
+
+An optional status code follows the body: `respond "Unavailable" 503`.
+Use `respond 204` for an empty response, or `respond ""` for an empty 200 response.
+Quote messages containing spaces; quoted strings support JSON escapes such as
+`\n`, `\"`, and `\\`. Braces and `#` inside quotes are literal text. A quoted
+number such as `respond "404"` is a body, whereas `respond 404` is a status code.
+Only final status codes 200–599 are accepted. Statuses 204, 205, and 304 cannot
+have a body. HEAD requests return the headers without the body.
+
+This small `respond` implementation always sends plain text; matchers, custom
+headers, automatic JSON content types, heredocs, and nested response blocks are
+not supported yet.
+
+## Proxy behavior and supported syntax
+
+Backend addresses default to HTTP. HTTPS backends verify the certificate and
+hostname, and receive their own hostname in `Host`; the original host is sent in
+`X-Forwarded-Host`. Paths, query strings, streaming bodies, and WebSocket upgrades
+are forwarded. The client-facing HTTPS listener supports HTTP/1.1 and HTTP/2;
+backend connections currently use HTTP/1.1. There is no gRPC support in this version.
+
+The parser deliberately supports this small syntax, not the full Caddyfile
+language. Unsupported directives, duplicate sites, wildcard hosts, local HTTPS,
+backend URL credentials/paths, and site-specific listener ports are rejected.
+
+## Files and reloads
+
+The default filename is `Geatafile`. Existing configurations with another name
+can still be loaded with `--config`, for example `geata run --config Proxyfile`.
+
+Edit the `Geatafile` to add or change sites. The proxy checks it every two seconds,
+applies valid changes to new requests, and lets in-flight requests finish. Invalid
+edits produce an error in the logs and leave the previous configuration running.
+Atomic symlink swaps are supported; reloads follow the configured path.
+Write edits atomically (save to a temporary file, then rename) to avoid loading an
+intermediate but syntactically valid version during a multi-step edit.
+
+An optional top-level `cashu_payout { ... }` block configures scheduled or
+balance-triggered [operator payouts](payouts.md), one block per mint.
+
+For request controls, see [rate limiting](rate-limiting.md) and
+[Cashu payments](cashu.md).
+
+Back to [Geata](../README.md).

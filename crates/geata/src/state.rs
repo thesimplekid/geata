@@ -3,10 +3,11 @@ use std::{collections::HashMap, sync::Arc};
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
-use crate::{certificates::Certificate, config::Config};
+use crate::{certificates::Certificate, config::Config, payments::Payments};
 
 pub struct State {
     pub config: ArcSwap<Config>,
+    pub payments: Option<Arc<Payments>>,
     pub certificates: RwLock<HashMap<String, Arc<Certificate>>>,
     pub challenges: RwLock<HashMap<(String, String), String>>,
 }
@@ -15,6 +16,7 @@ impl State {
     pub fn new(config: Config) -> Self {
         Self {
             config: ArcSwap::from_pointee(config),
+            payments: None,
             certificates: RwLock::new(HashMap::new()),
             challenges: RwLock::new(HashMap::new()),
         }
@@ -23,6 +25,16 @@ impl State {
     pub fn replace_config(&self, mut config: Config) {
         let previous = self.config.load();
         for (domain, site) in &mut config.sites {
+            if let (Some(next), Some(old)) = (
+                &site.capacity,
+                previous
+                    .sites
+                    .get(domain)
+                    .and_then(|site| site.capacity.as_ref()),
+            ) && next.max == old.max
+            {
+                site.capacity = Some(old.clone());
+            }
             if let (Some(next), Some(old)) = (
                 site.rate_limit.as_ref(),
                 previous

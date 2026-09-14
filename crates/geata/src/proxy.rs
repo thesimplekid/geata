@@ -15,6 +15,7 @@ use pingora::{
 
 use crate::{
     config::{Handler, Site, request_domain},
+    payments::PaymentError,
     state::State,
 };
 
@@ -30,6 +31,7 @@ pub struct RequestContext {
     started: Instant,
     addresses: Vec<SocketAddr>,
     address_index: usize,
+    _capacity: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 #[async_trait]
@@ -43,6 +45,7 @@ impl ProxyHttp for Proxy {
             started: Instant::now(),
             addresses: Vec::new(),
             address_index: 0,
+            _capacity: None,
         }
     }
 
@@ -110,7 +113,74 @@ impl ProxyHttp for Proxy {
             )
             .await;
         }
-        if let Some(limiter) = &site.rate_limit {
+        if let Some(capacity) = &site.capacity {
+            match capacity.permits.clone().try_acquire_owned() {
+                Ok(permit) => ctx._capacity = Some(permit),
+                Err(_) => {
+                    return respond_with_headers(
+                        session,
+                        503,
+                        "Site is at capacity.\n",
+                        &[("Retry-After", "1"), ("Cache-Control", "no-store")],
+                    )
+                    .await;
+                }
+            }
+        }
+        let payment_headers = session.req_header().headers.get_all("X-Cashu");
+        let supplied = site
+            .payment
+            .as_ref()
+            .and_then(|_| payment_headers.iter().next());
+        if let Some(value) = supplied {
+            if payment_headers.iter().count() != 1 {
+                return respond(session, 400, "Provide exactly one X-Cashu token.\n", None).await;
+            }
+            let Some(policy) = &site.payment else {
+                return respond(
+                    session,
+                    400,
+                    "This site does not accept Cashu payments.\n",
+                    None,
+                )
+                .await;
+            };
+            if !self.tls
+                && !session
+                    .client_addr()
+                    .and_then(|a| a.as_inet())
+                    .is_some_and(|a| a.ip().is_loopback())
+            {
+                return respond(session, 400, "Use HTTPS to send payment tokens.\n", None).await;
+            }
+            let Ok(encoded) = value.to_str() else {
+                return respond(session, 400, "Invalid Cashu token.\n", None).await;
+            };
+            let Some(payments) = &self.state.payments else {
+                return respond(session, 503, "Payments are unavailable.\n", None).await;
+            };
+            match payments.collect(&domain, policy, encoded).await {
+                Ok(()) => {}
+                Err(PaymentError::Invalid) => {
+                    return respond_with_headers(
+                        session,
+                        400,
+                        "Invalid, insufficient, or already used Cashu payment.\n",
+                        &[("Cache-Control", "no-store")],
+                    )
+                    .await;
+                }
+                Err(PaymentError::Unavailable) => {
+                    return respond_with_headers(
+                        session,
+                        503,
+                        "Payments temporarily unavailable; retry the same token.\n",
+                        &[("Retry-After", "1"), ("Cache-Control", "no-store")],
+                    )
+                    .await;
+                }
+            }
+        } else if let Some(limiter) = &site.rate_limit {
             let client = session
                 .client_addr()
                 .and_then(|address| address.as_inet())
@@ -121,6 +191,20 @@ impl ProxyHttp for Proxy {
             if let Err(wait) = limiter.check(client) {
                 let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() != 0);
                 let retry_after = seconds.max(1).to_string();
+                if let Some(payment) = &site.payment {
+                    let challenge = payment.challenge();
+                    return respond_with_headers(
+                        session,
+                        402,
+                        "Payment required, or wait for the free allowance.\n",
+                        &[
+                            ("X-Cashu", &challenge),
+                            ("Retry-After", &retry_after),
+                            ("Cache-Control", "no-store"),
+                        ],
+                    )
+                    .await;
+                }
                 return respond_with_headers(
                     session,
                     429,
@@ -130,8 +214,17 @@ impl ProxyHttp for Proxy {
                 .await;
             }
         }
+        // Never forward bearer tokens, including on backend retries.
+        if site.payment.is_some() {
+            session.req_header_mut().remove_header("X-Cashu");
+        }
         if let Handler::Respond { body, status } = &site.handler {
-            return respond(session, *status, body, None).await;
+            let headers = if site.payment.is_some() {
+                &[("Cache-Control", "no-store")][..]
+            } else {
+                &[]
+            };
+            return respond_with_headers(session, *status, body, headers).await;
         }
         ctx.site = Some(site);
         Ok(false)
@@ -198,6 +291,9 @@ impl ProxyHttp for Proxy {
         request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        if ctx.site.as_ref().is_some_and(|site| site.payment.is_some()) {
+            request.remove_header("X-Cashu");
+        }
         // Direct internet clients cannot assert a trusted forwarding chain.
         for header in [
             "forwarded",
@@ -228,6 +324,18 @@ impl ProxyHttp for Proxy {
                     &ctx.host
                 },
             )?;
+        }
+        Ok(())
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if ctx.site.as_ref().is_some_and(|site| site.payment.is_some()) {
+            response.insert_header("Cache-Control", "no-store")?;
         }
         Ok(())
     }
