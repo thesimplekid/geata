@@ -1,0 +1,4 @@
+# Direct local response: no backend or certificate authority needed.
+http://localhost {
+    respond "Hello world!"
+}

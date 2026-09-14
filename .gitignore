@@ -1,0 +1,7 @@
+/target/
+/result*
+/.direnv/
+/.state/
+/Proxyfile
+/Geatafile
+*.log

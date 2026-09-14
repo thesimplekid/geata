@@ -1,0 +1,8 @@
+# Point these domains at your server before starting the proxy.
+example.com {
+    reverse_proxy localhost:3000
+}
+
+api.example.com {
+    reverse_proxy localhost:8080
+}
