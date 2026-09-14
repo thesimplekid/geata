@@ -3,6 +3,7 @@ mod automation;
 mod certificates;
 mod config;
 mod proxy;
+mod rate_limit;
 mod retry;
 mod state;
 mod storage;

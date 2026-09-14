@@ -27,6 +27,9 @@ smoke: build
 faults: build
     python3 tests/acme_faults.py "${CARGO_TARGET_DIR:-target}/debug/geata"
 
+rate-limits: build
+    python3 tests/rate_limits.py "${CARGO_TARGET_DIR:-target}/debug/geata"
+
 regressions: build
     python3 tests/regressions.py "${CARGO_TARGET_DIR:-target}/debug/geata"
 

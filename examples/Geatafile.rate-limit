@@ -1,0 +1,6 @@
+# Run locally using the listener overrides shown in README.md.
+# Each IP gets a burst of 3 requests, refilling at 1 request per second.
+http://localhost {
+    rate_limit 1/s burst 3
+    respond "Hello world!"
+}

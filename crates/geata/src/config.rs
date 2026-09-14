@@ -1,7 +1,9 @@
-use std::{collections::BTreeMap, net::IpAddr, path::Path};
+use std::{collections::BTreeMap, net::IpAddr, path::Path, sync::Arc};
 
 use thiserror::Error;
 use url::Url;
+
+use crate::rate_limit::{Limit, RateLimiter};
 
 #[derive(Debug, Error)]
 #[error("Geatafile line {line}: {message}")]
@@ -23,6 +25,7 @@ pub struct Site {
     pub domain: String,
     pub https: bool,
     pub handler: Handler,
+    pub rate_limit: Option<Arc<RateLimiter>>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,29 +95,14 @@ impl Config {
                 .get(cursor)
                 .is_some_and(|t| matches!(t.kind, TokenKind::Close))
             {
-                return Err(error(
-                    line,
-                    "expected '}' after one reverse_proxy or respond directive",
-                ));
+                return Err(error(line, "expected '}' after site directives"));
             }
-            let args = &tokens[start..cursor];
-            let handler = match args.first().and_then(Token::text) {
-                Some("reverse_proxy") if args.len() == 2 => Handler::Proxy(
-                    parse_upstream(args[1].text().unwrap_or_default())
-                        .map_err(|message| error(args[1].line, &message))?,
-                ),
-                Some("respond") => parse_response(&args[1..], line)?,
-                _ => {
-                    return Err(error(
-                        line,
-                        "expected one directive: reverse_proxy <backend> or respond \"Hello world!\" [status]",
-                    ));
-                }
-            };
+            let (handler, rate_limit) = parse_directives(&tokens[start..cursor], line)?;
             let site = Site {
                 domain: domain.clone(),
                 https,
                 handler,
+                rate_limit: rate_limit.map(|limit| Arc::new(RateLimiter::new(limit))),
             };
             if sites.insert(domain.clone(), site).is_some() {
                 return Err(error(line, &format!("duplicate site {domain}")));
@@ -136,6 +124,92 @@ impl Config {
             .filter(|s| s.https)
             .map(|s| s.domain.as_str())
     }
+}
+
+fn parse_directives(
+    tokens: &[Token],
+    line: usize,
+) -> Result<(Handler, Option<Limit>), ConfigError> {
+    let mut handler = None;
+    let mut rate_limit = None;
+    let mut cursor = 0;
+    while cursor < tokens.len() {
+        let start = cursor;
+        let line = tokens[start].line;
+        let count = match tokens[start].text() {
+            Some("reverse_proxy") => 2,
+            Some("rate_limit") => 4,
+            Some("respond") => {
+                // The body is mandatory; a following directive cannot be its status.
+                let status = tokens.get(start + 2).is_some_and(|token| {
+                    token.quoted
+                        || !matches!(
+                            token.text(),
+                            Some("rate_limit" | "respond" | "reverse_proxy")
+                        )
+                });
+                2 + usize::from(status)
+            }
+            _ => 1,
+        };
+        cursor = (start + count).min(tokens.len());
+        let args = &tokens[start..cursor];
+        let error = |message: &str| ConfigError {
+            line,
+            message: message.to_owned(),
+        };
+        match args[0].text() {
+            Some("rate_limit") => {
+                if rate_limit.is_some() {
+                    return Err(error("duplicate rate_limit directive"));
+                }
+                let syntax = "expected rate_limit <positive integer>/s burst <positive integer>";
+                if args.len() != 4 || args[2].text() != Some("burst") {
+                    return Err(error(syntax));
+                }
+                let positive = |text: &str| {
+                    text.parse::<u32>()
+                        .ok()
+                        .filter(|n| *n > 0 && text.bytes().all(|b| b.is_ascii_digit()))
+                };
+                let per_second = args[1]
+                    .text()
+                    .and_then(|s| s.strip_suffix("/s"))
+                    .and_then(positive)
+                    .ok_or_else(|| error(syntax))?;
+                let burst = args[3]
+                    .text()
+                    .and_then(positive)
+                    .ok_or_else(|| error(syntax))?;
+                rate_limit = Some(Limit { per_second, burst });
+            }
+            Some("reverse_proxy" | "respond") => {
+                if handler.is_some() {
+                    return Err(error(
+                        "expected exactly one reverse_proxy or respond directive per site",
+                    ));
+                }
+                handler = Some(match args[0].text() {
+                    Some("reverse_proxy") if args.len() == 2 => Handler::Proxy(
+                        parse_upstream(args[1].text().unwrap_or_default())
+                            .map_err(|message| error(&message))?,
+                    ),
+                    Some("respond") => parse_response(&args[1..], line)?,
+                    _ => return Err(error("expected reverse_proxy <backend>")),
+                });
+            }
+            _ => {
+                return Err(error(
+                    "unknown directive; expected reverse_proxy, respond, or rate_limit",
+                ));
+            }
+        }
+    }
+    let handler = handler.ok_or_else(|| ConfigError {
+        line,
+        message: "expected exactly one reverse_proxy or respond directive per site".to_owned(),
+    })?;
+    Ok((handler, rate_limit))
 }
 
 struct Token {
@@ -374,6 +448,75 @@ mod tests {
         assert_eq!(backend.port, 8443);
         assert_eq!(backend.authority, "upstream.example:8443");
         Ok(())
+    }
+
+    #[test]
+    fn rate_limits_work_with_both_handlers_and_any_directive_order() -> anyhow::Result<()> {
+        let config = Config::parse(
+            r#"
+            example.com {
+                rate_limit 10/s burst 20
+                reverse_proxy localhost:3000
+            }
+            http://localhost { respond "rate_limit" rate_limit 2/s burst 3 }
+            http://unlimited { respond
+                "hello"
+            }
+        "#,
+        )?;
+        assert_eq!(
+            config.sites["example.com"]
+                .rate_limit
+                .as_ref()
+                .expect("limiter")
+                .limit,
+            Limit {
+                per_second: 10,
+                burst: 20
+            }
+        );
+        assert_eq!(
+            config.sites["localhost"]
+                .rate_limit
+                .as_ref()
+                .expect("limiter")
+                .limit,
+            Limit {
+                per_second: 2,
+                burst: 3
+            }
+        );
+        assert!(config.sites["unlimited"].rate_limit.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_limits_and_duplicate_directives_are_rejected() {
+        for directive in [
+            "rate_limit",
+            "rate_limit 10/s",
+            "rate_limit 10/s burst",
+            "rate_limit 0/s burst 2",
+            "rate_limit 1/s burst 0",
+            "rate_limit -1/s burst 2",
+            "rate_limit +1/s burst 2",
+            "rate_limit 1.5/s burst 2",
+            "rate_limit 1/m burst 2",
+            "rate_limit 1/s bursts 2",
+            "rate_limit 1/s burst nope",
+            "rate_limit 4294967296/s burst 2",
+            "rate_limit 1/s burst 4294967296",
+            "rate_limit 1/s burst 2 extra",
+            "rate_limit 1/s burst 2\nrate_limit 2/s burst 3",
+        ] {
+            let input = format!("http://localhost {{\n{directive}\nrespond \"ok\"\n}}");
+            let error = Config::parse(&input).expect_err("invalid limit accepted");
+            assert!(error.line >= 2, "{input}: {error}");
+        }
+        assert!(Config::parse("http://localhost { rate_limit 1/s burst 2 }").is_err());
+        assert!(
+            Config::parse("http://localhost { respond ok\nreverse_proxy localhost:3000 }").is_err()
+        );
     }
 
     #[test]

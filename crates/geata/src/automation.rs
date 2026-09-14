@@ -54,7 +54,7 @@ impl Automation {
                     match Config::parse(&text) {
                         Ok(config) => {
                             let count = config.sites.len();
-                            self.state.config.store(Arc::new(config));
+                            self.state.replace_config(config);
                             tracing::info!(sites = count, "configuration reloaded");
                         }
                         Err(error) => {

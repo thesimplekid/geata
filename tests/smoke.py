@@ -19,6 +19,7 @@ import time
 sys.dont_write_bytecode = True
 import acme_faults
 import regressions
+import rate_limits
 from support import Processes, connect, eventually, port, request, stop, temporary_directory, tls_fixture
 
 
@@ -111,6 +112,11 @@ def main():
         regression_root.mkdir()
         with Processes(regression_root) as regression_group:
             regressions.run(binary, regression_root, regression_group)
+
+        rate_root = root / "rate-limits"
+        rate_root.mkdir()
+        with Processes(rate_root) as rate_group:
+            rate_limits.run(binary, rate_root, rate_group)
 
         try:
             for label in ("A", "B"):
@@ -240,7 +246,7 @@ def main():
 
             # Multiple sites acquire independent certificates on a live reload.
             other = "other.example.test"
-            write_config(f'{domain} {{ reverse_proxy 127.0.0.1:{backend_a} }}\n{other} {{ respond "Hello world!" }}\n')
+            write_config(f'{domain} {{ reverse_proxy 127.0.0.1:{backend_a} }}\n{other} {{ rate_limit 1/s burst 20\nrespond "Hello world!" }}\n')
             eventually(lambda: request(https_port, other, context=trust)[0] == 200, timeout=45)
             assert request(https_port, other, context=trust)[2] == b"Hello world!"
             assert request(http_port, other)[0] == 308

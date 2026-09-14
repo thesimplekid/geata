@@ -18,6 +18,9 @@ chains and hostnames, waits for a short-lived certificate to renew, checks confi
 reloads, and restarts the proxy with the CA offline to verify persistence.
 Direct responses are checked over HTTP/1.1 and HTTP/2, including quoting, HEAD,
 status-only responses, and reloads between proxy and response handlers.
+Rate-limit unit tests use a controlled clock for refill, burst, bounded memory,
+and concurrency. Executable tests check per-IP/site isolation, rejected requests
+staying out of the backend, spoofed headers, HTTP/HTTPS, Retry-After, and reloads.
 The suite also injects failed HTTP-01 validation, corrupt certificate files,
 certificate-save failures, and a CA outage lasting through certificate expiry.
 A separate TLS fault server stalls an order while later domains proceed, then
@@ -33,10 +36,11 @@ For HTTP-only checks, use `just smoke`. For focused tests, use:
 ```sh
 just regressions  # retry safety, config symlinks/defaults, CA URL validation, staging reuse
 just faults       # stalled orders and persistent CA rate limits; no Pebble needed
+just rate-limits  # visitor limits, backend protection, TLS, and reloads
 ```
 
 The scripts share socket, process, and private TLS fixtures in `tests/support.py`.
-The full integration run includes both focused suites.
+The full integration run includes all three focused suites.
 
 Public staging issuance is an opt-in test, separate from the reproducible local
 gate. It requires a domain whose public DNS points to this machine, reachable

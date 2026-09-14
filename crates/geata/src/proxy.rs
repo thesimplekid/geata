@@ -110,6 +110,26 @@ impl ProxyHttp for Proxy {
             )
             .await;
         }
+        if let Some(limiter) = &site.rate_limit {
+            let client = session
+                .client_addr()
+                .and_then(|address| address.as_inet())
+                .ok_or_else(|| {
+                    Error::explain(ErrorType::InternalError, "request has no client IP")
+                })?
+                .ip();
+            if let Err(wait) = limiter.check(client) {
+                let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() != 0);
+                let retry_after = seconds.max(1).to_string();
+                return respond_with_headers(
+                    session,
+                    429,
+                    "Too many requests.\n",
+                    &[("Retry-After", &retry_after), ("Cache-Control", "no-store")],
+                )
+                .await;
+            }
+        }
         if let Handler::Respond { body, status } = &site.handler {
             return respond(session, *status, body, None).await;
         }
@@ -230,15 +250,25 @@ async fn respond(
     body: &str,
     location: Option<&str>,
 ) -> Result<bool> {
-    let mut header = ResponseHeader::build(status, Some(4))?;
+    let headers = location.map(|value| ("Location", value));
+    respond_with_headers(session, status, body, headers.as_slice()).await
+}
+
+async fn respond_with_headers(
+    session: &mut Session,
+    status: u16,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> Result<bool> {
+    let mut header = ResponseHeader::build(status, Some(3 + headers.len()))?;
     header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
     let no_body = matches!(status, 204 | 205 | 304);
     // 204 must not carry Content-Length; 304 does not describe a selected representation here.
     if !matches!(status, 204 | 304) {
         header.insert_header("Content-Length", body.len().to_string())?;
     }
-    if let Some(location) = location {
-        header.insert_header("Location", location)?;
+    for &(name, value) in headers {
+        header.insert_header(name.to_owned(), value)?;
     }
     let end = session.req_header().method == http::Method::HEAD || no_body || body.is_empty();
     session.write_response_header(Box::new(header), end).await?;
