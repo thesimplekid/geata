@@ -18,6 +18,12 @@ use pingora::{
     server::{Server, configuration::ServerConf},
     services::background::background_service,
 };
+use tracing_subscriber::{
+    Layer,
+    filter::{FilterExt, filter_fn},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use crate::{
     automation::Automation, certificates::DynamicTls, config::Config, proxy::Proxy, state::State,
@@ -106,10 +112,17 @@ enum WalletAction {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+    let requested =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    // Pingora's trace events include complete request headers. Keep its trace
+    // level disabled even when broad dependency tracing is requested so bearer
+    // tokens, cookies, and authorization credentials cannot enter logs.
+    let safe_dependencies = filter_fn(|metadata| {
+        metadata.level() != &tracing::Level::TRACE
+            || !metadata.target().starts_with("pingora_proxy")
+    });
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(requested.and(safe_dependencies)))
         .init();
     match Cli::parse().command {
         Command::Wallet {

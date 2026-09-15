@@ -76,6 +76,11 @@ for this first version (10 seconds to connect; 5 minutes read/write inactivity).
 Unknown hosts return 404; unknown or removed TLS names fail the TLS handshake.
 SIGTERM shuts down gracefully with a bounded drain period.
 
+`RUST_LOG` controls log verbosity. Trace-level events from Pingora's proxy layer
+are always suppressed because they contain complete request headers, including
+credentials and bearer tokens; debug-level dependency diagnostics remain
+available.
+
 ## Current scope
 
 This is a working foundation, not yet a feature-complete or hardened Caddy

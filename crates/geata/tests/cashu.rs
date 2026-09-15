@@ -293,6 +293,7 @@ fn start(root: &Path, http: u16, https: u16) -> anyhow::Result<Proxy> {
         .append(true)
         .open(root.join("proxy.log"))?;
     let child = Command::new(env!("CARGO_BIN_EXE_geata"))
+        .env("RUST_LOG", "pingora_proxy=trace,geata=info")
         .args(["run", "--config"])
         .arg(root.join("Geatafile"))
         .arg("--data-dir")
@@ -415,9 +416,14 @@ http://direct.local {{
         let payment = PaymentRequest::from_str(&headers["x-cashu"])?;
         assert_eq!(payment.amount, Some(Amount::from(2)));
         assert_eq!(headers["cache-control"], "no-store");
+        let log_canary = "cashuB-SECRET-LOG-CANARY";
         assert_eq!(
-            settled_request(hp, "localhost", "/backend", Some("bad"))?.0,
+            settled_request(hp, "localhost", "/backend", Some(log_canary))?.0,
             400
+        );
+        assert!(
+            !std::fs::read_to_string(root.path().join("proxy.log"))?.contains(log_canary),
+            "Pingora trace logging exposed the Cashu token"
         );
         // Face value meets the advertised price, but cannot cover the input fee.
         let underpaid = mint.token(&mint_url, 2)?;

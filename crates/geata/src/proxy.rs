@@ -14,7 +14,7 @@ use pingora::{
 };
 
 use crate::{
-    config::{Handler, Site, request_domain},
+    config::{CapacityPermit, Handler, Site, request_domain},
     payments::PaymentError,
     state::State,
 };
@@ -31,7 +31,7 @@ pub struct RequestContext {
     started: Instant,
     addresses: Vec<SocketAddr>,
     address_index: usize,
-    _capacity: Option<tokio::sync::OwnedSemaphorePermit>,
+    _capacity: Option<CapacityPermit>,
 }
 
 #[async_trait]
@@ -113,10 +113,17 @@ impl ProxyHttp for Proxy {
             )
             .await;
         }
+        let client = session
+            .client_addr()
+            .and_then(|address| address.as_inet())
+            .map(|address| address.ip());
         if let Some(capacity) = &site.capacity {
-            match capacity.permits.clone().try_acquire_owned() {
-                Ok(permit) => ctx._capacity = Some(permit),
-                Err(_) => {
+            let client = client.ok_or_else(|| {
+                Error::explain(ErrorType::InternalError, "request has no client IP")
+            })?;
+            match capacity.try_acquire(client) {
+                Some(permit) => ctx._capacity = Some(permit),
+                None => {
                     return respond_with_headers(
                         session,
                         503,
@@ -181,13 +188,9 @@ impl ProxyHttp for Proxy {
                 }
             }
         } else if let Some(limiter) = &site.rate_limit {
-            let client = session
-                .client_addr()
-                .and_then(|address| address.as_inet())
-                .ok_or_else(|| {
-                    Error::explain(ErrorType::InternalError, "request has no client IP")
-                })?
-                .ip();
+            let client = client.ok_or_else(|| {
+                Error::explain(ErrorType::InternalError, "request has no client IP")
+            })?;
             if let Err(wait) = limiter.check(client) {
                 let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() != 0);
                 let retry_after = seconds.max(1).to_string();

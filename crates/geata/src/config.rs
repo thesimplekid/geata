@@ -1,14 +1,19 @@
-use std::{collections::BTreeMap, net::IpAddr, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::IpAddr,
+    path::Path,
+    sync::Arc,
+};
 
+use parking_lot::Mutex;
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::{
     payments::PaymentPolicy,
     rate_limit::{Limit, RateLimiter},
 };
-use tokio::sync::Semaphore;
-
 #[derive(Debug, Error)]
 #[error("Geatafile line {line}: {message}")]
 pub struct ConfigError {
@@ -37,7 +42,60 @@ pub struct Site {
 #[derive(Clone, Debug)]
 pub struct Capacity {
     pub max: u32,
-    pub permits: Arc<Semaphore>,
+    per_client: u32,
+    permits: Arc<Semaphore>,
+    clients: Arc<Mutex<HashMap<IpAddr, u32>>>,
+}
+
+pub struct CapacityPermit {
+    client: IpAddr,
+    clients: Arc<Mutex<HashMap<IpAddr, u32>>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Capacity {
+    fn new(max: u32) -> Self {
+        Self {
+            max,
+            // For limits above one, reserve at least half of the site's capacity
+            // for other client addresses. A limit of one is inherently exclusive.
+            per_client: (max / 2).max(1),
+            permits: Arc::new(Semaphore::new(max as usize)),
+            clients: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn try_acquire(&self, client: IpAddr) -> Option<CapacityPermit> {
+        let client = client.to_canonical();
+        let mut clients = self.clients.lock();
+        if clients.get(&client).copied().unwrap_or(0) >= self.per_client {
+            return None;
+        }
+        let permit = self.permits.clone().try_acquire_owned().ok()?;
+        *clients.entry(client).or_default() += 1;
+        drop(clients);
+        Some(CapacityPermit {
+            client,
+            clients: self.clients.clone(),
+            _permit: permit,
+        })
+    }
+}
+
+impl Drop for CapacityPermit {
+    fn drop(&mut self) {
+        let mut clients = self.clients.lock();
+        let remove = if let Some(count) = clients.get_mut(&self.client) {
+            *count -= 1;
+            *count == 0
+        } else {
+            debug_assert!(false, "capacity permit has no client counter");
+            false
+        };
+        if remove {
+            clients.remove(&self.client);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -143,10 +201,7 @@ impl Config {
                 handler,
                 rate_limit: rate_limit.map(|limit| Arc::new(RateLimiter::new(limit))),
                 payment,
-                capacity: max_inflight.map(|max| Capacity {
-                    max,
-                    permits: Arc::new(Semaphore::new(max as usize)),
-                }),
+                capacity: max_inflight.map(Capacity::new),
             };
             if sites.insert(domain.clone(), site).is_some() {
                 return Err(error(line, &format!("duplicate site {domain}")));
@@ -623,6 +678,25 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn capacity_reserves_half_of_the_site_for_other_clients() {
+        let capacity = Capacity::new(4);
+        let first = "192.0.2.1".parse().expect("client IP");
+        let second = "192.0.2.2".parse().expect("client IP");
+        let third = "192.0.2.3".parse().expect("client IP");
+
+        let first_a = capacity.try_acquire(first).expect("first permit");
+        let first_b = capacity.try_acquire(first).expect("second permit");
+        assert!(capacity.try_acquire(first).is_none());
+        let second_a = capacity.try_acquire(second).expect("other client permit");
+        let second_b = capacity.try_acquire(second).expect("other client permit");
+        assert!(capacity.try_acquire(third).is_none());
+
+        drop(first_a);
+        assert!(capacity.try_acquire(first).is_some());
+        drop((first_b, second_a, second_b));
     }
 
     #[test]
