@@ -8,7 +8,7 @@
 <body>
   <header><a class="brand" href="/" aria-label="Geata home"><span class="gate">g</span> geata</a><span class="pill"><i></i> LOCAL DEMO</span></header>
   <main>
-    <div class="intro"><div><p class="eyebrow">TRAFFIC & PAYMENTS</p><h1>Watch the gate work.</h1><p class="subtitle">Send requests. Use the free allowance. See the price of going beyond it.</p></div><span id="connection" class="connection" role="status">Connecting…</span></div>
+    <div class="intro"><div><p class="eyebrow">TRAFFIC & PAYMENTS</p><h1>Busy gate. Paid access.</h1><p class="subtitle">Fill the free allowance, then compare unpaid and paid requests while traffic keeps flowing.</p></div><span id="connection" class="connection" role="status">Connecting…</span></div>
     <section class="metrics" aria-label="Live statistics">
       <article><p>Current request rate</p><div class="value"><span id="rps">0</span><small>req/s</small></div><span>Completed in the last second</span></article>
       <article><p>Free allowance</p><div class="value"><span id="free-rate">—</span><small>req/s</small></div><span id="burst">Per IP · loading burst allowance</span></article>
@@ -16,18 +16,27 @@
       <article><p>Total overflow quotes</p><div class="value"><span id="quoted">0</span><small>sat</small></div><span>Quoted this run, not charged</span></article>
     </section>
     <div class="workspace">
-      <section class="panel traffic"><div class="panel-title"><div><p class="eyebrow">LIVE TRAFFIC</p><h2>The last 30 seconds</h2></div><div class="legend"><span><i class="accepted"></i>Accepted</span><span><i class="required"></i>Payment required</span><span><i class="errors"></i>Errors</span></div></div>
+      <section class="panel traffic"><div class="panel-title"><div><p class="eyebrow">LIVE TRAFFIC</p><h2>The last 30 seconds</h2></div><div class="legend"><span><i class="accepted"></i>Unpaid · 200</span><span><i class="paid"></i>Paid · 200</span><span><i class="required"></i>Blocked · 402</span><span><i class="errors"></i>Errors</span></div></div>
         <svg id="chart" viewBox="0 0 740 230" role="img" aria-label="Requests per second over the last 30 seconds"></svg>
         <div class="chart-foot"><span>30 seconds ago</span><span>Now</span></div>
-        <div class="totals"><div><strong id="total">0</strong><span>Total requests</span></div><div><strong id="accepted">0</strong><span>Accepted · 200</span></div><div><strong id="required">0</strong><span>Payment required · 402</span></div><div><strong id="errors">0</strong><span>Other errors</span></div></div>
+        <div class="totals"><div><strong id="total">0</strong><span>Total requests</span></div><div><strong id="accepted">0</strong><span>Unpaid · 200</span></div><div><strong id="paid-total">0</strong><span>Paid · 200</span></div><div><strong id="required">0</strong><span>Blocked · 402</span></div><div><strong id="errors">0</strong><span>Other errors</span></div></div>
       </section>
-      <section class="panel controls"><p class="eyebrow">TRY IT</p><h2>Turn up the traffic</h2><p>Start below the free allowance, then push past it.</p>
-        <label for="rate">Traffic target <strong><output id="target">10</output> req/s</strong></label><input id="rate" type="range" min="1" max="50" value="10"><div class="range-labels"><span>1 req/s</span><span>50 req/s</span></div>
-        <button id="toggle" class="primary" disabled>Start traffic</button><div class="button-row"><button id="single" disabled>Send one</button><button id="burst-button" disabled>Send a burst of 20</button></div>
-        <p id="activity" class="activity" role="status">Waiting for Geata…</p><div class="note"><strong>Traffic controls send free requests only.</strong><p>A 402 offers the fixed price, or you can wait for the free allowance to refill. Traffic never changes the price.</p></div>
+      <section class="panel controls"><p class="eyebrow">1 · CREATE LOAD</p><h2>Turn up the traffic</h2><p>Start high traffic and wait for unpaid requests to return 402.</p>
+        <button id="overload" class="primary" disabled>Start high traffic</button>
+        <label for="rate">Unpaid traffic <strong><output id="target">10</output> req/s</strong></label><input id="rate" type="range" min="1" max="50" value="10"><div class="range-labels"><span>1 req/s</span><span id="max-rate">50 req/s</span></div>
+        <div class="button-row"><button id="toggle" disabled>Start traffic</button><button id="burst-button" disabled>Burst of 20 unpaid</button></div>
+        <p id="activity" class="activity" role="status">Waiting for Geata…</p><div class="note"><strong>Only overflow is blocked.</strong><p>Some unpaid requests still pass as the free allowance refills. A valid payment bypasses that allowance at a fixed price.</p></div>
       </section>
     </div>
-    <section class="panel payment-panel"><div><p class="eyebrow">CASHU PAYMENT</p><h2>Try a paid request</h2><p>Accepted mint: <a id="mint" target="_blank" rel="noreferrer">Loading…</a></p><p>Use a <code>cashuB</code> token from this mint, in sats, with DLEQ proofs and enough value to cover the price plus mint fees.</p><p class="payment-terms">This spends your token for one request attempt. Excess value is kept; no change or automatic refund. Real-mint tokens spend real funds.</p><p class="paid-count"><strong id="paid-count">0</strong> paid requests accepted this run</p></div><form id="payment-form"><label for="token">Cashu token</label><input id="token" type="password" placeholder="cashuB…" autocomplete="off" spellcheck="false" maxlength="16384" required><button id="pay" class="primary" disabled>Pay for one request</button><p id="payment-status" role="status">Tokens are sent only when you press Pay. They are not saved in your browser.</p></form></section>
+    <section class="panel comparison"><div class="panel-title"><div><p class="eyebrow">2 · COMPARE UNDER LOAD</p><h2>Same gate. Unpaid or paid.</h2></div><span id="pressure" class="pressure" role="status">Waiting for traffic…</span></div>
+      <p class="comparison-intro">Keep high traffic running and try both buttons. Each result stays here as the request log fills up.</p>
+      <div class="comparison-grid">
+        <article class="request-option unpaid-option"><h3>Unpaid request</h3><p>Uses the shared free allowance. When it is empty, Geata blocks the request with <strong>402 Payment Required</strong>.</p><button id="single" disabled>Send unpaid request</button><p id="unpaid-status" class="request-result" role="status">No unpaid probe sent yet.</p><p class="outcome-count"><strong id="blocked-count">0</strong> unpaid requests blocked this run</p></article>
+        <article class="request-option paid-option"><h3>Paid request</h3><p>A valid Cashu payment bypasses the free allowance and reaches the backend with <strong>200 OK</strong>, even during unpaid overflow.</p><form id="payment-form"><label for="token">Cashu token</label><input id="token" type="password" placeholder="cashuB…" autocomplete="off" spellcheck="false" maxlength="16384" required><button id="pay" class="primary" disabled>Send paid request</button><p id="payment-status" class="request-result" role="status">Paste a token to try paid access. Traffic keeps running when you pay.</p></form><p class="outcome-count"><strong id="paid-count">0</strong> paid requests accepted this run</p></article>
+      </div>
+      <details class="payment-help"><summary>How to get a payment token</summary><p>Use a Cashu wallet to get a <code>cashuB</code> token from <a id="mint" target="_blank" rel="noreferrer">Loading…</a>, in sats, with DLEQ proofs and enough value for the price plus mint fees. The default test mint uses tokens with no real value.</p><p>Tokens are sent only when you press Send paid request. They are not saved in your browser.</p></details>
+      <p class="payment-terms">Each payment spends your token for one request attempt. Excess value is kept; no change or automatic refund. Real-mint tokens spend real funds.</p>
+    </section>
     <section class="panel requests"><div class="panel-title"><div><p class="eyebrow">REQUEST LOG</p><h2>What Geata returned</h2></div><span class="muted">Latest 12 requests · all demo visitors</span></div><div class="table-scroll"><table><thead><tr><th>Time</th><th>Response</th><th>Latency</th><th>Quote</th><th>Retry after</th></tr></thead><tbody id="requests"><tr><td colspan="5" class="empty">Send your first request to see the result here.</td></tr></tbody></table></div></section>
     <footer><span>Browser → demo relay → Geata → “Hello world” backend</span><span>Metrics cover dashboard-generated requests only. All visitors share one loopback IP.</span></footer>
   </main>

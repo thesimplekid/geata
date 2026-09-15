@@ -52,10 +52,19 @@
             '';
             clippy = craneLib.cargoClippy (args // { cargoClippyExtraArgs = "--all-targets -- -D warnings"; });
             tests = craneLib.cargoTest args;
-            demo = pkgs.runCommand "geata-demo-check" { nativeBuildInputs = [ pkgs.python3 ]; } ''
-              python3 ${./examples/traffic-demo}/check.py ${package}/bin/geata
-              touch $out
-            '';
+            demo =
+              pkgs.runCommand "geata-demo-check"
+                {
+                  nativeBuildInputs = [
+                    pkgs.python3
+                    pkgs.nodejs
+                  ];
+                }
+                ''
+                  python3 ${./examples/traffic-demo}/check.py ${package}/bin/geata
+                  node ${./examples/traffic-demo}/check-ui.cjs
+                  touch $out
+                '';
             integration =
               pkgs.runCommand "geata-integration"
                 {
@@ -94,6 +103,7 @@
             openssl
             just
             python3
+            nodejs
             curl
             pebble
           ];

@@ -32,6 +32,7 @@ demo *args:
 
 demo-check binary="result/bin/geata":
     python3 examples/traffic-demo/check.py "$1"
+    node examples/traffic-demo/check-ui.cjs
 
 cashu:
     cargo test --locked --workspace --test cashu

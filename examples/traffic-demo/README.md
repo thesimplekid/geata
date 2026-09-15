@@ -12,9 +12,19 @@ nix build path:.
 nix develop path:. -c just demo
 ```
 
-Open **http://127.0.0.1:9090**. Start traffic, adjust the target rate, or send a
-burst. The default allowance is 5 requests/second per IP with a burst of 10;
+Open **http://127.0.0.1:9090**. Press **Start high traffic** to send unpaid requests
+at a target of four times the free refill rate. Wait for the overflow indicator
+to show **Unpaid overflow is returning 402**, then compare **Send unpaid request**
+and **Send paid request** in the two cards below the graph. Paid requests require
+a Cashu token (see below); submitting one keeps the background traffic running.
+Each card keeps its latest manual result visible even as new traffic fills the
+request log. You can also adjust the target rate or send an unpaid burst.
+
+The default allowance is 5 requests/second per IP with a burst of 10;
 overflow requests return 402 with a fixed price of 2 sats, plus mint fees.
+Some unpaid requests still succeed under load as the free allowance refills.
+Valid paid requests bypass that allowance. The graph and counters distinguish
+unpaid successes, paid successes, blocked requests, and other errors.
 
 Configure the mint, allowance, and price when starting:
 
@@ -31,7 +41,7 @@ mint supported by Geata; real-mint tokens spend real funds. Free traffic and
 To make a payment, use a Cashu wallet to obtain a `cashuB` token from the selected
 mint, in sats, with DLEQ proofs and no spending conditions. Include enough value
 for the configured price **and mint input fees**. Paste it into the dashboard and
-press **Pay for one request**. There is no automatic token minting or Lightning
+press **Send paid request**. There is no automatic token minting or Lightning
 invoice payment. The traffic generator never submits payments automatically.
 
 One payment buys one request attempt. Excess value is retained; there is no
@@ -82,5 +92,8 @@ just demo --port 9091 --proxy-port 8081 --geata /path/to/geata
 
 Run `just demo-check` to exercise the demo against `result/bin/geata`, including
 real free/402 responses, metrics, configuration, payment rejection, and cleanup.
-The smoke test also runs in `nix flake check`. It does not contact a mint or
-spend tokens.
+It also runs a Node.js regression check of the dashboard controls, including
+keeping traffic active during a payment and preserving the comparison results.
+Node.js is provided by the development shell and is only needed for this check.
+Both checks also run in `nix flake check`. They do not contact a mint or spend
+tokens; the UI check supplies payment responses locally.

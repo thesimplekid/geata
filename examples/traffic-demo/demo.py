@@ -31,6 +31,8 @@ class Metrics:
             self.totals['total'] += 1
             if paid and status == 200:
                 self.totals['paid_accepted'] += 1
+            if not paid and status == 402:
+                self.totals['unpaid_blocked'] += 1
             self.totals['accepted' if status == 200 else 'payment_required' if status == 402 else 'errors'] += 1
         return event
 
@@ -38,12 +40,17 @@ class Metrics:
         now = time.time()
         with self.lock:
             events, totals = list(self.events), dict(self.totals)
-        buckets = [dict(accepted=0, payment_required=0, errors=0) for _ in range(30)]
+        buckets = [dict(accepted=0, unpaid_accepted=0, paid_accepted=0,
+                        payment_required=0, unpaid_blocked=0, errors=0) for _ in range(30)]
         for event in events:
             age = int(now) - int(event['time'])
             if 0 <= age < 30:
                 key = 'accepted' if event['status'] == 200 else 'payment_required' if event['status'] == 402 else 'errors'
                 buckets[29 - age][key] += 1
+                if event['status'] == 200:
+                    buckets[29 - age]['paid_accepted' if event['paid'] else 'unpaid_accepted'] += 1
+                if not event['paid'] and event['status'] == 402:
+                    buckets[29 - age]['unpaid_blocked'] += 1
         return dict(config=dict(rate=self.args.rate, burst=self.args.burst, price=self.args.price,
                                 mint=self.args.mint, proxy_port=self.args.proxy_port, data_dir=str(self.args.data_dir)),
                     totals=totals, rps=sum(now - event['time'] < 1 for event in events),

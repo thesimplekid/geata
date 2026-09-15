@@ -4,6 +4,7 @@
   --muted:#6c7c75;
   --line:#dce5df;
   --green:#318165;
+  --blue:#5475c5;
   --gold:#e0aa42;
   --red:#d25d57;
   --paper:#f5f7f3;
@@ -189,6 +190,9 @@ h2 {
 .accepted {
   background:var(--green);
 }
+.paid {
+  background:var(--blue);
+}
 .required {
   background:var(--gold);
 }
@@ -218,7 +222,7 @@ h2 {
   margin-top:23px;
   padding-top:19px;
   display:grid;
-  grid-template-columns:repeat(4,1fr);
+  grid-template-columns:repeat(5,1fr);
   gap:10px;
 }
 .totals strong {
@@ -363,6 +367,10 @@ td:first-child {
   color:#286b51;
   background:#edf5ef;
 }
+.badge.paid {
+  color:#37549c;
+  background:#edf1fc;
+}
 .badge.pay {
   color:#8b651b;
   background:#fbf3df;
@@ -467,59 +475,113 @@ footer {
     gap:6px;
   }
 }
-.payment-panel {
-  display:grid;
-  grid-template-columns:1fr 340px;
-  gap:36px;
+.comparison {
   margin-bottom:22px;
 }
-.payment-panel p {
+.comparison p {
   font-size:12px;
   color:var(--muted);
   margin:12px 0 0;
 }
-.payment-panel a {
+.comparison a {
   color:var(--green);
   overflow-wrap:anywhere;
 }
-.payment-panel code {
+.comparison code {
   color:var(--ink);
 }
-.payment-panel .payment-terms {
+.comparison .payment-terms {
   font-size:11px;
   max-width:610px;
 }
-.payment-panel form {
+.comparison form {
   display:flex;
   flex-direction:column;
-  justify-content:center;
   gap:10px;
+  margin-top:18px;
 }
-.payment-panel label {
+.comparison label {
   font-size:12px;
 }
-.payment-panel input {
+.comparison input {
   width:100%;
   padding:12px;
   border:1px solid var(--line);
   border-radius:7px;
   font:13px ui-monospace,monospace;
 }
-.payment-panel form p {
-  min-height:36px;
-  font-size:11px;
+.comparison-grid {
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:18px;
+  margin-top:20px;
+}
+.request-option {
+  border:1px solid var(--line);
+  border-top:3px solid var(--gold);
+  border-radius:8px;
+  padding:22px;
+}
+.paid-option {
+  border-top-color:var(--blue);
+}
+.request-option h3 {
+  font-size:18px;
   margin:0;
 }
-.payment-panel .paid-count {
+.unpaid-option button {
+  width:100%;
+  margin-top:18px;
+}
+.comparison .request-result {
+  padding:12px;
+  min-height:65px;
+  border-radius:6px;
+  background:var(--paper);
+  font-weight:600;
+}
+.comparison .request-result[data-outcome=blocked],.pressure.overflowing {
+  color:#8b651b;
+  background:#fbf3df;
+}
+.comparison .request-result[data-outcome=ok] {
+  color:#286b51;
+  background:#edf5ef;
+}
+.comparison .request-result[data-outcome=paid] {
+  color:#37549c;
+  background:#edf1fc;
+}
+.comparison .request-result[data-outcome=error] {
+  color:#a1423d;
+  background:#fbedeb;
+}
+.pressure {
+  font-size:12px;
+  padding:8px 12px;
+  border-radius:6px;
+  color:var(--muted);
+}
+.payment-help {
+  margin-top:20px;
+  font-size:12px;
+}
+.payment-help summary {
+  cursor:pointer;
+}
+.comparison .outcome-count {
   color:var(--ink);
 }
-.paid-count strong {
+.outcome-count strong {
   font-size:18px;
   margin-right:4px;
 }
 @media(max-width:720px) {
-  .payment-panel {
+  .comparison-grid {
     grid-template-columns:1fr;
-    gap:22px;
+  }
+  .comparison .panel-title {
+    align-items:flex-start;
+    flex-direction:column;
   }
 }

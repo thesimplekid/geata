@@ -10,6 +10,26 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
+from unittest.mock import patch
+
+sys.dont_write_bytecode = True
+from demo import Metrics
+
+
+def check_metrics():
+    metrics = Metrics(SimpleNamespace(rate=1, burst=2, price=7,
+                                      mint='https://mint.example.com', proxy_port=8080, data_dir='unused'))
+    with patch('demo.time.time', return_value=100):
+        for status, paid in [(200, False), (200, True), (402, False), (400, True), (503, False)]:
+            metrics.record(status, 1, None, paid=paid)
+        stats = metrics.snapshot()
+    assert stats['totals'] == dict(total=5, accepted=2, paid_accepted=1,
+                                  payment_required=1, unpaid_blocked=1, errors=2)
+    assert stats['history'][-1] == dict(accepted=2, unpaid_accepted=1, paid_accepted=1,
+                                      payment_required=1, unpaid_blocked=1, errors=2)
+    assert stats['quoted_sats'] == 7
+    assert 'cashuB' not in json.dumps(stats)
 
 
 def port():
@@ -19,6 +39,7 @@ def port():
 
 
 def main():
+    check_metrics()
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else 'result/bin/geata').resolve()
     dashboard, proxy = port(), port()
     scratch = os.environ.get('TMPDIR') or ('/data/rust/tmp' if Path('/data/rust/tmp').is_dir() else None)
@@ -63,6 +84,9 @@ def main():
                 stats = request('/api/stats')[1]
                 assert stats['totals']['total'] == 12
                 assert stats['totals']['accepted'] > 0 and stats['totals']['payment_required'] > 0
+                assert stats['totals']['unpaid_blocked'] == stats['totals']['payment_required']
+                assert sum(b['unpaid_accepted'] for b in stats['history']) == stats['totals']['accepted']
+                assert sum(b['paid_accepted'] for b in stats['history']) == 0
                 assert stats['quoted_sats'] == sum(e['status'] == 402 for e in events) * 7
                 assert all(e['retry_after'] for e in events if e['status'] == 402)
                 token = 'cashuBinvalid-demo-token'
