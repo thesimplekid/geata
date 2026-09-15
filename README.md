@@ -1,5 +1,8 @@
 # Geata
 
+> **Repository note:** The main repository is [git.cashu.dev/thesimplekid/geata](https://git.cashu.dev/thesimplekid/geata).
+> [github.com/thesimplekid/geata](https://github.com/thesimplekid/geata) is a mirror.
+
 Geata (Irish for “gate”) is a Rust reverse proxy that lets clients **pay for
 requests beyond a free rate limit using Cashu**. It combines Caddy-style
 configuration and automatic HTTPS with payment handling at the proxy.
