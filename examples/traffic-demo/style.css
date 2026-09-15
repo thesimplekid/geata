@@ -309,7 +309,7 @@ button:focus-visible,a:focus-visible,input:focus-visible {
   padding:9px 5px;
 }
 .controls .activity {
-  min-height:18px;
+  min-height:3em;
   margin:10px 0 16px!important;
   font-size:11px!important;
 }
@@ -336,9 +336,13 @@ button:focus-visible,a:focus-visible,input:focus-visible {
 table {
   width:100%;
   min-width:600px;
+  table-layout:fixed;
   border-collapse:collapse;
   font-size:12px;
   text-align:left;
+}
+th:nth-child(2) {
+  width:30%;
 }
 th {
   font-size:10px;
@@ -557,6 +561,10 @@ footer {
   background:#fbedeb;
 }
 .pressure {
+  flex:0 0 auto;
+  width:260px;
+  max-width:100%;
+  min-height:52px;
   font-size:12px;
   padding:8px 12px;
   border-radius:6px;

@@ -72,6 +72,7 @@ async function main() {
   assert.equal(intervals.size, 1);
   const traffic = [...intervals.values()][0];
   assert.equal(traffic.delay, 10);
+  const runningStatus = elements.activity.textContent;
 
   // Fill all eight background slots. A manual probe must still get through.
   const flood = deferred();
@@ -95,6 +96,11 @@ async function main() {
   const before = calls.length;
   await traffic.callback();
   assert.equal(calls.length, before + 1, 'Unpaid traffic continues while the mint is responding');
+  unpaid.status = 200;
+  await traffic.callback();
+  unpaid.status = 402;
+  await traffic.callback();
+  assert.equal(elements.activity.textContent, runningStatus, 'Mixed responses must not replace the running status');
   payment.resolve(response({status: 200, paid: true}));
   await submitting;
   assert.equal(elements.token.value, '');
@@ -117,6 +123,15 @@ async function main() {
   assert.equal(elements.token.value, 'cashuBretry');
   assert.match(elements['payment-status'].textContent, /retry the same token/);
   assert.equal(intervals.size, 1);
+
+  // Requests already in flight must not overwrite the stopped status.
+  background = deferred();
+  const finishing = traffic.callback();
+  elements.toggle.handlers.click();
+  const stoppedStatus = elements.activity.textContent;
+  background.resolve(response(unpaid));
+  await finishing;
+  assert.equal(elements.activity.textContent, stoppedStatus);
 
   statsOnline = false;
   await vm.runInContext('poll()', context);

@@ -32,11 +32,12 @@ async function sendOne(probe = false) {
     const response = await fetch('/api/request', {method: 'POST', signal: AbortSignal.timeout(7000)});
     if (!response.ok) throw new Error('The demo is busy or disconnected.');
     const event = await response.json();
-    const message = event.status === 200 ? '200 · Unpaid request used the free allowance.' : event.status === 402
-      ? `402 · Unpaid request blocked. Payment required, or retry in ${event.retry_after || '1'}s.`
-      : `${event.status} · Request failed. No payment was sent.`;
-    if (probe) showResult('unpaid-status', message, event.status === 200 ? 'ok' : event.status === 402 ? 'blocked' : 'error');
-    else $('activity').textContent = message;
+    if (probe) {
+      const message = event.status === 200 ? '200 · Unpaid request used the free allowance.' : event.status === 402
+        ? `402 · Unpaid request blocked. Payment required, or retry in ${event.retry_after || '1'}s.`
+        : `${event.status} · Request failed. No payment was sent.`;
+      showResult('unpaid-status', message, event.status === 200 ? 'ok' : event.status === 402 ? 'blocked' : 'error');
+    }
   } catch (error) {
     if (probe) showResult('unpaid-status', error.message, 'error');
     else stopTraffic(error.message);
@@ -53,7 +54,7 @@ function startTraffic() {
   timer = setInterval(sendOne, 1000 / Number($('rate').value));
   $('toggle').textContent = 'Stop traffic';
   $('toggle').classList.add('running');
-  $('activity').textContent = 'Sending real requests through Geata…';
+  $('activity').textContent = `Sending unpaid traffic at ${$('rate').value} req/s.`;
 }
 $('toggle').addEventListener('click', () => timer === null ? startTraffic() : stopTraffic());
 $('single').addEventListener('click', () => sendOne(true));
@@ -64,8 +65,10 @@ $('overload').addEventListener('click', () => {
 });
 $('burst-button').addEventListener('click', async () => {
   $('burst-button').disabled = true;
+  if (timer === null) $('activity').textContent = 'Sending a burst of 20 unpaid requests…';
   for (let i = 0; i < 20 && connected; i++) await sendOne();
   $('burst-button').disabled = !connected;
+  if (connected && timer === null) $('activity').textContent = 'Burst complete. See the graph and request log.';
 });
 $('rate').addEventListener('input', () => {
   $('target').value = $('rate').value;
