@@ -74,14 +74,6 @@ never delete payment journals to reset request limits. Replays remain rejected
 across restarts and configuration reloads. Changing a site's price or mint may
 prevent retrying an earlier interrupted payment against that site.
 
-## Legacy SQLite ledgers
-
-On first opening a mint wallet, Geata automatically imports any existing
-`ledger.sqlite` into redb in one durable transaction. Claimed and pending payments
-are preserved. The old SQLite ledger is retained, but subsequent admissions use
-redb only. Do not run an older Geata binary against this data directory after
-migration: its SQLite ledger will no longer contain current admission records.
-
 ## Interrupted payments
 
 If the mint response is lost or Geata restarts during redemption, retry the same

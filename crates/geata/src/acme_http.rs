@@ -9,7 +9,7 @@ use hyper_util::{
 };
 use instant_acme::{BodyWrapper, BytesResponse, Error, HttpClient};
 use parking_lot::Mutex;
-use rustls_pki_types::{CertificateDer, pem::PemObject};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 
 use crate::{certificates::now, storage::Storage};
 

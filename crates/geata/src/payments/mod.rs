@@ -381,7 +381,6 @@ fn prepare_storage(directory: &Path) -> anyhow::Result<([u8; 64], Ledger)> {
     if !seed_path.try_exists()? {
         ensure!(
             !directory.join("wallet.sqlite").try_exists()?
-                && !directory.join("ledger.sqlite").try_exists()?
                 && !directory.join("ledger.redb").try_exists()?,
             "payment seed is missing; restore it from backup"
         );
@@ -401,21 +400,11 @@ fn prepare_storage(directory: &Path) -> anyhow::Result<([u8; 64], Ledger)> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid payment seed"))?;
     private_file(&directory.join("ledger.redb"))?;
-    for name in ["wallet.sqlite", "ledger.sqlite"] {
-        let path = directory.join(name);
-        if name == "ledger.sqlite" {
-            match fs::symlink_metadata(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-                Ok(_) => {}
-            }
-        }
-        private_file(&path)?;
-        for suffix in ["-wal", "-shm"] {
-            let path = directory.join(format!("{name}{suffix}"));
-            if path.try_exists()? {
-                private_file(&path)?;
-            }
+    private_file(&directory.join("wallet.sqlite"))?;
+    for suffix in ["-wal", "-shm"] {
+        let path = directory.join(format!("wallet.sqlite{suffix}"));
+        if path.try_exists()? {
+            private_file(&path)?;
         }
     }
     Ok((seed, Ledger::open(&directory.join("ledger.redb"))?))
@@ -455,7 +444,6 @@ mod tests {
         let (seed, ledger) = prepare_storage(&directory)?;
         drop(ledger);
         assert_eq!(prepare_storage(&directory)?.0, seed);
-        assert!(!directory.join("ledger.sqlite").exists());
         for name in ["seed", "wallet.sqlite", "ledger.redb"] {
             assert_eq!(
                 fs::metadata(directory.join(name))?.permissions().mode() & 0o777,

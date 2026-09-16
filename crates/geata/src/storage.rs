@@ -49,7 +49,7 @@ impl Storage {
             .truncate(false)
             .mode(0o600)
             .open(root.join("proxy.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock)
+        lock.try_lock()
             .context("another proxy is using this data directory")?;
         // Separate accounts and certificates for each CA, especially staging vs production.
         let hash = openssl::sha::sha256(directory_url.as_bytes());

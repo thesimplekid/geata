@@ -758,7 +758,7 @@ fn scheduled_nostr_payout_delivers_an_encrypted_payment() -> anyhow::Result<()> 
         .add_transport(Transport {
             _type: TransportType::Nostr,
             target: profile.to_bech32()?,
-            tags: vec![vec!["n".into(), "17".into()]],
+            tags: vec![],
         })
         .build()
         .to_string();

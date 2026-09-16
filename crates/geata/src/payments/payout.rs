@@ -1,6 +1,5 @@
 use super::*;
 use cdk::nuts::TransportType;
-use nostr_sdk::{FromBech32, nips::nip19::Nip19Profile};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,7 +145,8 @@ pub fn validate_request(
         .or(amount)
         .filter(|n| *n > 0)
         .context("payment request requires a positive amount")?;
-    // Match CDK's transport preference, and validate before reserving funds.
+    // Match CDK's transport preference for HTTP destination checks.
+    // CDK handles Nostr profiles and relay delivery.
     let transport = request
         .transports
         .iter()
@@ -158,28 +158,13 @@ pub fn validate_request(
                 .find(|t| t._type == TransportType::HttpPost)
         })
         .context("payment request needs HTTP POST or Nostr transport")?;
-    match transport._type {
-        TransportType::HttpPost => validate_target(&transport.target, "https", "http")?,
-        TransportType::Nostr => {
-            ensure!(
-                transport.tags.iter().any(|t| t == &["n", "17"]),
-                "Nostr payout requires NIP-17 transport"
-            );
-            let profile = Nip19Profile::from_bech32(&transport.target)
-                .map_err(|_| anyhow::anyhow!("invalid Nostr payment profile"))?;
-            ensure!(
-                !profile.relays.is_empty() && profile.relays.len() <= 8,
-                "Nostr payment profile requires 1 to 8 relays"
-            );
-            for relay in profile.relays {
-                validate_target(relay.as_str(), "wss", "ws")?;
-            }
-        }
+    if transport._type == TransportType::HttpPost {
+        validate_http_target(&transport.target)?;
     }
     Ok((request, amount))
 }
 
-fn validate_target(target: &str, secure: &str, local: &str) -> anyhow::Result<()> {
+fn validate_http_target(target: &str) -> anyhow::Result<()> {
     let url =
         url::Url::parse(target).map_err(|_| anyhow::anyhow!("invalid payout transport URL"))?;
     let loopback = url.host_str().is_some_and(|h| {
@@ -190,7 +175,7 @@ fn validate_target(target: &str, secure: &str, local: &str) -> anyhow::Result<()
     });
     ensure!(
         url.host_str().is_some()
-            && (url.scheme() == secure || (url.scheme() == local && loopback))
+            && (url.scheme() == "https" || (url.scheme() == "http" && loopback))
             && url.username().is_empty()
             && url.password().is_none()
             && url.fragment().is_none(),
@@ -367,6 +352,7 @@ impl MintWallet {
 mod tests {
     use super::*;
     use cdk::nuts::Transport;
+    use nostr_sdk::{ToBech32, nips::nip19::Nip19Profile};
 
     fn request() -> PaymentRequest {
         PaymentRequest::builder()
@@ -424,7 +410,6 @@ mod tests {
         }
         let keys = nostr_sdk::Keys::generate();
         let profile = Nip19Profile::new(keys.public_key(), ["wss://relay.example".parse()?]);
-        use nostr_sdk::ToBech32;
         let mut nostr = request;
         nostr.transports = vec![Transport {
             _type: TransportType::Nostr,
@@ -433,7 +418,7 @@ mod tests {
         }];
         assert!(validate_request(&nostr.to_string(), &mint, None).is_ok());
         nostr.transports[0].tags.clear();
-        assert!(validate_request(&nostr.to_string(), &mint, None).is_err());
+        assert!(validate_request(&nostr.to_string(), &mint, None).is_ok());
         Ok(())
     }
 

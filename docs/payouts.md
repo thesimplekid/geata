@@ -61,9 +61,11 @@ never bypasses a saved unresolved payout.
 
 Payment requests use [NUT-18](https://cashubtc.github.io/nuts/18/). Geata supports
 HTTP POST destinations and encrypted Nostr NIP-17 delivery through the request's
-`nprofile` relays. CDK prefers Nostr when both are present. Public destinations
-require HTTPS or WSS; plain HTTP/WS is allowed only on loopback for tests. Nostr
-profiles must include 1–8 relays and the `n=17` transport tag.
+`nprofile` relays. CDK prefers Nostr when both are present and handles Nostr
+profile parsing and relay delivery. Geata does not impose additional Nostr
+profile, relay, or transport-tag checks; invalid Nostr destinations can fail
+during delivery rather than configuration validation. HTTP POST destinations
+require HTTPS; plain HTTP is allowed only on loopback for tests.
 
 Requests without a transport cannot be used for payouts; use `wallet export`
 for a token you deliver yourself. Automatic payouts reject single-use requests.

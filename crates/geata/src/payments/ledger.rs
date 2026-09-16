@@ -4,7 +4,6 @@ use anyhow::ensure;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
-use rusqlite::{Connection, OpenFlags};
 
 // Version the table names so incompatible record layouts cannot be read silently.
 const PAYMENTS: TableDefinition<&str, (&str, u32, bool)> = TableDefinition::new("payments_v1");
@@ -34,32 +33,11 @@ impl Ledger {
                 Some(1) => {}
                 Some(_) => anyhow::bail!("unsupported payment ledger version"),
                 None => {
-                    let mut payments = tx.open_table(PAYMENTS)?;
+                    let payments = tx.open_table(PAYMENTS)?;
                     ensure!(
                         payments.is_empty()?,
                         "unversioned payment ledger is not empty"
                     );
-                    let legacy = path.with_extension("sqlite");
-                    if legacy.try_exists()? {
-                        // Import once, atomically with the version marker. Never modify
-                        // the old ledger or overwrite newer redb admission decisions.
-                        let connection =
-                            Connection::open_with_flags(legacy, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                        let mut query =
-                            connection.prepare("SELECT id, site, price, claimed FROM payments")?;
-                        let mut rows = query.query([])?;
-                        while let Some(row) = rows.next()? {
-                            let id: String = row.get(0)?;
-                            let site: String = row.get(1)?;
-                            let price: u32 = row.get(2)?;
-                            let claimed: i64 = row.get(3)?;
-                            ensure!(
-                                price > 0 && matches!(claimed, 0 | 1),
-                                "invalid legacy payment record"
-                            );
-                            payments.insert(id.as_str(), (site.as_str(), price, claimed == 1))?;
-                        }
-                    }
                     metadata.insert("version", 1)?;
                 }
             }
@@ -180,6 +158,7 @@ mod tests {
             ledger.reserve("token", "site", 3).await?,
             Reservation::Mismatch
         );
+        assert!(!ledger.claim("missing").await?);
         let (first, second) = tokio::join!(ledger.claim("token"), ledger.claim("token"));
         assert_ne!(first?, second?);
         drop(ledger);
@@ -197,87 +176,6 @@ mod tests {
         assert_eq!(
             ledger.reserve("pending", "site", 2).await?,
             Reservation::Pending
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn legacy_import_preserves_records_and_does_not_repeat() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let legacy = root.path().join("ledger.sqlite");
-        let connection = Connection::open(&legacy)?;
-        connection.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
-             CREATE TABLE payments (id TEXT PRIMARY KEY, site TEXT, price INTEGER, claimed INTEGER);
-             INSERT INTO payments VALUES ('used', 'site', 2, 1), ('pending', 'site', 3, 0);",
-        )?;
-        // Keep SQLite open so the import must also see committed WAL records.
-        let path = root.path().join("ledger.redb");
-        let ledger = Ledger::open(&path)?;
-        assert_eq!(
-            ledger.reserve("used", "site", 2).await?,
-            Reservation::Claimed
-        );
-        assert_eq!(
-            ledger.reserve("used", "other", 2).await?,
-            Reservation::Mismatch
-        );
-        assert_eq!(
-            ledger.reserve("pending", "site", 2).await?,
-            Reservation::Mismatch
-        );
-        assert_eq!(
-            ledger.reserve("pending", "site", 3).await?,
-            Reservation::Pending
-        );
-        assert!(ledger.claim("pending").await?);
-        assert!(!ledger.claim("missing").await?);
-        drop(ledger);
-        let old_claimed: bool = connection.query_row(
-            "SELECT claimed FROM payments WHERE id = 'pending'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert!(
-            !old_claimed,
-            "migration must leave the SQLite records unchanged"
-        );
-        drop(connection);
-        let ledger = Ledger::open(&path)?;
-        assert_eq!(
-            ledger.reserve("pending", "site", 3).await?,
-            Reservation::Claimed
-        );
-        drop(ledger);
-        // A completed import no longer depends on the old database.
-        fs::write(&legacy, b"unreadable old backup")?;
-        let ledger = Ledger::open(&path)?;
-        assert_eq!(
-            ledger.reserve("used", "site", 2).await?,
-            Reservation::Claimed
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_import_rolls_back_and_can_be_retried() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let connection = Connection::open(root.path().join("ledger.sqlite"))?;
-        connection.execute_batch(
-            "CREATE TABLE payments (id TEXT PRIMARY KEY, site TEXT, price INTEGER, claimed INTEGER);
-             INSERT INTO payments VALUES ('used', 'site', 2, 1), ('invalid', 'site', 2, 7);",
-        )?;
-        let path = root.path().join("ledger.redb");
-        assert!(Ledger::open(&path).is_err());
-        connection.execute("DELETE FROM payments WHERE id = 'invalid'", [])?;
-        let ledger = Ledger::open(&path)?;
-        assert_eq!(
-            ledger.reserve("used", "site", 2).await?,
-            Reservation::Claimed
-        );
-        assert_eq!(
-            ledger.reserve("invalid", "site", 2).await?,
-            Reservation::New
         );
         Ok(())
     }
