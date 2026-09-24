@@ -12,8 +12,8 @@ cargo build --locked
 Or run `nix build path:.` for `result/bin/geata`. The other guides use `geata`
 as the command name; substitute `./result/bin/geata` when using this build.
 Without Nix, install the Rust version in `rust-toolchain.toml`, a C/C++ compiler,
-CMake, pkg-config, and OpenSSL development libraries, then run
-`OPENSSL_NO_VENDOR=1 cargo build --locked` to use your system OpenSSL.
+CMake, pkg-config, and OpenSSL and libsodium development libraries, then run
+`OPENSSL_NO_VENDOR=1 SODIUM_USE_PKG_CONFIG=1 cargo build --locked` to use the system libraries.
 
 Run the included Hello world example on unprivileged ports; no backend is needed:
 

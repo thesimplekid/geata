@@ -1,9 +1,10 @@
-# Lightning payments with LDK Server
+# Lightning payments with LDK Server or a Cashu mint
 
-Geata can offer Lightning x402 payments alongside Cashu, or on their own.
-Run a separate [LDK Server](https://github.com/lightningdevkit/ldk-server) instance
+Geata can offer Lightning x402 and L402 payments alongside Cashu, or on their own.
+For x402, run a separate [LDK Server](https://github.com/lightningdevkit/ldk-server) instance
 with incoming Lightning liquidity. Geata creates invoices through its authenticated
-TLS gRPC API. Funds stay on that node; Cashu funds continue to use Geata's mint wallet.
+TLS gRPC API. Funds stay on that node. L402 can instead receive through a Cashu
+mint, keeping the proceeds in Geata's Cashu wallet without your own node.
 
 The adapter targets `api.LightningNode/Bolt11Receive` with the description-hash
 variant of `Bolt11InvoiceDescription`, as defined at LDK Server commit
@@ -86,9 +87,123 @@ Invalid edits leave the previous configuration running. Credential files are rea
 when issuing invoices, so replacing them does not require a reload. No separate
 JSON configuration file is used.
 
+## Receiving L402 through a Cashu mint
+
+To receive L402 payments without running your own Lightning node, define a mint
+receiver. The mint runs the Lightning infrastructure and holds the sats backing
+your Cashu balance; choose a mint you trust.
+
+```caddyfile
+lightning my_mint {
+    mint https://mint.example.com
+    network mainnet
+}
+
+example.com {
+    rate_limit 10/s burst 20
+    pay_over_limit 2 sat https://mint.example.com
+    lightning_over_limit 2 sat my_mint
+    lightning_protocols l402
+    lightning_headers accept content-encoding content-type cookie range
+    reverse_proxy localhost:3000
+}
+```
+
+The receiver accepts only `mint` and `network` (`mainnet` or `testnet`). The mint
+must support BOLT11 mint quotes denominated in sats. Public mint URLs require
+HTTPS; loopback HTTP is allowed for testing. The mint chooses invoice expiry;
+Geata requires it to fit within the quote expiry and the next 24 hours. No LDK
+endpoint, node public key, or API key file is needed.
+
+Mint receivers require **`lightning_protocols l402`**. Lightning x402 still needs
+LDK Server because ordinary mint invoices do not support its required signed
+request-description hash. L402 binds the request through its signed macaroon.
+Direct Cashu and mint-backed L402 can be offered together; they share the wallet
+when configured with the same mint URL. Each site currently selects one named
+Lightning receiver.
+
+Geata privately persists the mint quote and its association with the invoice
+before advertising a challenge. A customer pays the Lightning invoice and sends
+the normal L402 credential. Geata verifies the credential, claims the ecash into
+its wallet, then durably consumes the payment for one request attempt. It requires
+a completed local mint transaction; a preimage or remote payment-status response
+alone does not grant admission. The quote ID and quote signing key are never
+included in the public challenge.
+
+If the mint is unavailable, settlement returns 503: retry the same credential.
+A lost mint response can be recovered through CDK's persisted mint operation and
+signature restoration. For reliable recovery, use a mint supporting NUT-09.
+Wallet dependency logs are suppressed because they can contain private quotes
+or token material; Geata reports failures without those details.
+
+A background loop also claims paid deposits when a client never retries. It checks
+up to 32 outstanding quotes per mint per pass, rotates through pending quotes,
+and retains expired quotes for recovery of already-paid funds. The loop pauses
+30 seconds between passes and shares the wallet lock with direct Cashu admission
+and payouts. Previously used receiver mints remain recorded and checked across
+restarts, even if their sites are removed, so paid deposits can still be collected.
+Recovery collects funds; it does not spend the HTTP request allowance.
+
+Proceeds use the existing [Cashu wallet and payout commands](cashu.md). Back up
+**both** `<data-dir>/payments` and `<data-dir>/lightning` while Geata is stopped.
+The former contains wallet seeds, quote keys, and ecash; the latter contains L402
+credentials, quote associations, and replay protection. Do not delete either to
+reset limits.
+
+## L402 alongside x402 and Cashu
+
+`lightning_protocols` selects `x402`, `l402`, or both; it defaults to `x402`.
+To offer all three payment methods, use this site with the receiver above:
+
+```caddyfile
+example.com {
+    rate_limit 10/s burst 20
+    pay_over_limit 2 sat https://mint.example.com
+    lightning_over_limit 2 sat my_node
+    lightning_protocols x402 l402
+    lightning_headers accept content-encoding content-type cookie range
+    reverse_proxy localhost:3000
+}
+```
+
+When L402 is enabled, `Authorization` is reserved for the payment credential.
+It cannot appear in `lightning_headers`; other Authorization schemes are rejected,
+even on free requests. Use a bound cookie or custom header for backend authentication.
+Existing x402-only sites can continue binding and forwarding backend Authorization.
+
+An HTTP 402 response advertises L402 using:
+
+```http
+WWW-Authenticate: L402 macaroon="<base64>", invoice="<bolt11>"
+```
+
+The client pays the invoice and retries the identical request with:
+
+```http
+Authorization: L402 <base64-macaroon>:<hex-preimage>
+```
+
+With both Lightning protocols enabled, `PAYMENT-REQUIRED` contains the **same
+invoice**. Redeeming either proof consumes it for both protocols. Cashu remains
+a separate alternative, advertised in `X-Cashu`. Send exactly one payment method.
+L402 credentials are stripped before forwarding. Invalid, expired, or reused
+L402 credentials return 401 without issuing another invoice; storage failures
+return 503. Successful L402 requests do not add an x402 `PAYMENT-RESPONSE`.
+
+This implements HTTP [L402](https://github.com/lightninglabs/L402/blob/master/protocol-specification.md)
+using V2 macaroons with V0 identifiers and per-credential random root keys.
+Each credential buys one request attempt, not a reusable subscription or quota.
+The signed first-party caveats bind the `geata:0` service, request hash, current
+payment terms, and expiry (including the same 60-second grace as x402).
+The supported predicates are `services`, `geata_request`, `geata_terms`,
+`geata_valid_until` (exclusive Unix seconds), and optional `preimage`.
+Clients can append matching predicates or shorten the expiry; unknown or
+unsatisfied caveats, third-party caveats, and macaroon bundles are rejected.
+The gRPC L402 profile is not supported.
+
 ## Payment flow
 
-After the free allowance runs out, a 402 response includes `PAYMENT-REQUIRED`
+With x402 enabled, after the free allowance runs out, a 402 response includes `PAYMENT-REQUIRED`
 containing a base64-encoded x402 v2 challenge. Sites with Cashu also include
 `X-Cashu`. A client selects one method per request; providing both payment headers
 is rejected before either payment is processed.
@@ -99,13 +214,15 @@ the 32-byte payment preimage as lowercase hex. Geata checks the invoice signatur
 receiver, amount, network, expiry, request binding, and preimage locally. It
 records the payment hash durably before forwarding or serving the request.
 Successful admission adds `PAYMENT-RESPONSE` with the payment hash and network.
-No external facilitator or node lookup is needed to settle a proof.
+LDK-backed proofs need no external facilitator or node lookup for settlement.
+Mint-backed L402 also needs confirmation that ecash has reached the local wallet.
 
 An explicit payment always selects paid admission, even if the free allowance
 has refilled. A paid request buys **one attempt**, including backend errors or a
-crash after admission. There is no automatic refund. Invalid or reused proofs
-return 400; storage and receiver failures return 503. A receiver outage still
-allows Cashu challenges and valid previously issued Lightning proofs.
+crash after admission. There is no automatic refund. Invalid or reused x402 proofs
+return 400 (L402 returns 401); storage and receiver failures return 503. An LDK receiver outage still
+allows Cashu challenges and valid previously issued LDK-backed Lightning proofs.
+Mint-backed L402 requires the mint until its ecash has been received.
 
 Invoice creation has a separate per-IP limit of one per second with a burst of
 three, shared across sites. If issuance is unavailable or the request cannot be
@@ -120,7 +237,7 @@ This implements the `http:1` profile of
 The signed description hash binds the method, complete URL with query order
 preserved, body bytes, and configured headers. A retry must preserve those values.
 Unused invoices for identical requests and terms are accepted without maintaining
-a challenge database. Settlement allows the specification's 60-second clock-skew
+a challenge database for x402. L402 also requires its stored credential root key. Settlement allows the specification's 60-second clock-skew
 grace; newly issued invoices must be unexpired.
 
 `lightning_headers` is required and must list **every** header affecting the operation,
@@ -135,7 +252,7 @@ Lightning challenge and paid-request bodies are buffered with a 64 KiB limit and
 a 10-second read timeout. Upgrades and declared trailers are unsupported. Free
 requests and Cashu requests retain their existing streaming behavior.
 
-Use a receiver node key whose invoice issuance is exclusive to this service.
+For LDK receivers, use a node key whose invoice issuance is exclusive to this service.
 Do not share its invoice API with untrusted tenants. All Geata sites using a
 receiver share one replay journal. Independent Geata instances must not settle
 for that same receiver: this version has no shared multi-instance replay store.
@@ -145,12 +262,16 @@ for that same receiver: this version has no shared multi-instance replay store.
 The private replay database is `<data-dir>/lightning/settlements.redb`, separate
 from Cashu storage. Back it up with the rest of Geata's data while stopped.
 Never delete it to reset limits. Used payment hashes are retained indefinitely,
-including across config reloads and restarts. A lost journal loses replay protection.
+including across config reloads and restarts. L402 root keys are also stored privately
+in this database and retained indefinitely. Losing it invalidates outstanding L402
+credentials and loses x402 replay protection. Protect backups as payment secrets.
 LDK Server's own backups and channel operations remain separate responsibilities.
 
 `cargo test --test lightning` exercises the binary against a local TLS/gRPC
 receiver fixture with signed invoices and HMAC authentication. Unit tests check
 the specification's HTTP binding vectors, proof validation, concurrent settlement,
-and restart persistence. These tests do not operate a live Lightning channel.
+and restart persistence. `cargo test --test cashu` also exercises mint-backed L402,
+lost mint responses, deposit recovery, and a shared Cashu balance. These tests do
+not operate a live Lightning channel.
 
 Back to [Geata](../README.md).

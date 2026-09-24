@@ -217,7 +217,13 @@ fn request(
     let mut socket = TcpStream::connect(("127.0.0.1", port))?;
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     let payment = payment
-        .map(|p| format!("PAYMENT-SIGNATURE: {p}\r\n"))
+        .map(|p| {
+            if p.starts_with("L402 ") {
+                format!("Authorization: {p}\r\n")
+            } else {
+                format!("PAYMENT-SIGNATURE: {p}\r\n")
+            }
+        })
         .unwrap_or_default();
     write!(
         socket,
@@ -256,6 +262,35 @@ fn proof(challenge: &str, preimage: u8) -> anyhow::Result<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ldk_receiver_and_cashu_coexist_with_durable_bound_admission() -> anyhow::Result<()> {
+    admission(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l402_x402_and_cashu_share_single_use_invoices() -> anyhow::Result<()> {
+    admission(true).await
+}
+
+fn selected_proof(challenge: &str, preimage: u8, l402: bool) -> anyhow::Result<String> {
+    if !l402 {
+        return proof(challenge, preimage);
+    }
+    let auth = header(challenge, "www-authenticate").expect("L402 challenge");
+    let (macaroon, invoice) = auth
+        .strip_prefix("L402 macaroon=\"")
+        .expect("scheme")
+        .split_once("\", invoice=\"")
+        .expect("invoice");
+    let required: Value = serde_json::from_slice(
+        &STANDARD.decode(header(challenge, "payment-required").expect("x402 challenge"))?,
+    )?;
+    assert_eq!(
+        required["accepts"][0]["extra"]["invoice"],
+        invoice.trim_end_matches('"')
+    );
+    Ok(format!("L402 {macaroon}:{}", hex(&[preimage; 32])))
+}
+
+async fn admission(l402: bool) -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let (pem, cert, key) = certificate()?;
     std::fs::write(root.path().join("tls.crt"), pem)?;
@@ -289,6 +324,9 @@ async fn ldk_receiver_and_cashu_coexist_with_durable_bound_admission() -> anyhow
             }
             assert!(header(&headers, "payment-signature").is_none());
             assert!(header(&headers, "x-cashu").is_none());
+            if l402 {
+                assert!(header(&headers, "authorization").is_none());
+            }
             let length: usize = header(&headers, "content-length").unwrap_or("0").parse()?;
             let mut body = vec![0; length];
             reader.read_exact(&mut body)?;
@@ -305,9 +343,19 @@ async fn ldk_receiver_and_cashu_coexist_with_durable_bound_admission() -> anyhow
     std::fs::write(
         &config,
         format!(
-            "lightning node {{ endpoint https://localhost:{receiver_port} api_key_file {} tls_cert_file {} pay_to 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 network mainnet }}\nhttp://localhost {{\nrate_limit 1/s burst 1\npay_over_limit 2 sat https://mint.example.com\nlightning_over_limit 25 sat node\nlightning_headers authorization content-type\nlightning_origin http://localhost:{port}\nreverse_proxy 127.0.0.1:{backend_port}\n}}",
+            "lightning node {{ endpoint https://localhost:{receiver_port} api_key_file {} tls_cert_file {} pay_to 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 network mainnet }}\nhttp://localhost {{\nrate_limit 1/s burst 1\npay_over_limit 2 sat https://mint.example.com\nlightning_over_limit 25 sat node\nlightning_headers {}\n{}\nlightning_origin http://localhost:{port}\nreverse_proxy 127.0.0.1:{backend_port}\n}}",
             root.path().join("api_key").display(),
             root.path().join("tls.crt").display(),
+            if l402 {
+                "content-type"
+            } else {
+                "authorization content-type"
+            },
+            if l402 {
+                "lightning_protocols x402 l402"
+            } else {
+                ""
+            },
         ),
     )?;
     let start = || -> anyhow::Result<Process> {
@@ -349,7 +397,8 @@ async fn ldk_receiver_and_cashu_coexist_with_durable_bound_admission() -> anyhow
     )?;
     assert_eq!(status, 402, "{challenge}");
     assert!(header(&challenge, "x-cashu").is_some());
-    let paid = proof(&challenge, 1)?;
+    let paid = selected_proof(&challenge, 1, l402)?;
+    let invalid_status = if l402 { 401 } else { 400 };
     assert_eq!(
         request(
             port,
@@ -360,7 +409,7 @@ async fn ldk_receiver_and_cashu_coexist_with_durable_bound_admission() -> anyhow
             b"body"
         )?
         .0,
-        400
+        invalid_status
     );
     assert_eq!(
         request(
@@ -372,7 +421,7 @@ async fn ldk_receiver_and_cashu_coexist_with_durable_bound_admission() -> anyhow
             b"different"
         )?
         .0,
-        400
+        invalid_status
     );
     assert_eq!(
         request(
@@ -384,7 +433,7 @@ async fn ldk_receiver_and_cashu_coexist_with_durable_bound_admission() -> anyhow
             b"body"
         )?
         .0,
-        400
+        invalid_status
     );
     assert_eq!(
         request(
@@ -407,7 +456,7 @@ async fn ldk_receiver_and_cashu_coexist_with_durable_bound_admission() -> anyhow
         b"body",
     )?;
     assert_eq!(status, 200, "{response}");
-    assert!(header(&response, "payment-response").is_some());
+    assert_eq!(header(&response, "payment-response").is_some(), !l402);
     assert!(response.ends_with("admitted"));
     assert_eq!(
         count.load(Ordering::SeqCst),
@@ -424,8 +473,23 @@ async fn ldk_receiver_and_cashu_coexist_with_durable_bound_admission() -> anyhow
             b"body"
         )?
         .0,
-        400
+        invalid_status
     );
+    if l402 {
+        let x402 = proof(&challenge, 1)?;
+        assert_eq!(
+            request(
+                port,
+                "POST",
+                "/article?a=1",
+                Some(&x402),
+                "Content-Type: text/plain\r\n",
+                b"body"
+            )?
+            .0,
+            400
+        );
+    }
     drop(process);
     backend_thread.join().expect("backend thread")?;
     // Restart into a direct-response handler while preserving the replay database.
@@ -445,15 +509,43 @@ async fn ldk_receiver_and_cashu_coexist_with_durable_bound_admission() -> anyhow
             b"body"
         )?
         .0,
-        400
+        invalid_status
     );
     assert_eq!(request(port, "GET", "/", None, "", b"")?.0, 200);
     let (status, challenge) = request(port, "GET", "/", None, "", b"")?;
     assert_eq!(status, 402);
-    let paid = proof(&challenge, 2)?;
+    let paid = selected_proof(&challenge, 2, l402)?;
     let (status, response) = request(port, "GET", "/", Some(&paid), "", b"")?;
     assert_eq!(status, 200);
-    assert!(header(&response, "payment-response").is_some());
+    assert_eq!(header(&response, "payment-response").is_some(), !l402);
+    if l402 {
+        drop(_process);
+        let updated = std::fs::read_to_string(&config)?
+            .replace("lightning_protocols x402 l402", "lightning_protocols l402");
+        std::fs::write(&config, updated)?;
+        let process = start()?;
+        assert_eq!(request(port, "GET", "/", None, "", b"")?.0, 200);
+        let (status, challenge) = request(port, "GET", "/", None, "", b"")?;
+        assert_eq!(status, 402);
+        assert!(header(&challenge, "payment-required").is_none());
+        let token = header(&challenge, "www-authenticate")
+            .expect("L402 challenge")
+            .strip_prefix("L402 macaroon=\"")
+            .expect("scheme")
+            .split('"')
+            .next()
+            .expect("macaroon");
+        let paid = format!("L402 {token}:{}", hex(&[3; 32]));
+        assert_eq!(
+            request(port, "GET", "/", Some("disabled x402"), "", b"")?.0,
+            400
+        );
+        // Outstanding credentials, including their root keys, survive restart.
+        drop(process);
+        let _restarted = start()?;
+        assert_eq!(request(port, "GET", "/", Some(&paid), "", b"")?.0, 200);
+        assert_eq!(request(port, "GET", "/", Some(&paid), "", b"")?.0, 401);
+    }
     receiver_task.abort();
     Ok(())
 }

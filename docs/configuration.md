@@ -1,7 +1,7 @@
 # Configuration
 
 Each site has exactly one `reverse_proxy` or `respond` directive, with optional
-`rate_limit`, `pay_over_limit`, `lightning_over_limit`, `lightning_headers`,
+`rate_limit`, `pay_over_limit`, `lightning_over_limit`, `lightning_protocols`, `lightning_headers`,
 `lightning_origin`, and `max_inflight` settings. Braces can
 appear on one line or multiple lines. Blank lines and `#` comments outside quoted
 strings are supported.
@@ -74,9 +74,10 @@ intermediate but syntactically valid version during a multi-step edit.
 An optional top-level `cashu_payout { ... }` block configures scheduled or
 balance-triggered [operator payouts](payouts.md), one block per mint.
 
-A top-level `lightning <name> { ... }` block defines a shared LDK Server receiver.
+A top-level `lightning <name> { ... }` block defines a shared LDK Server or Cashu mint receiver.
 Sites reference its name with `lightning_over_limit` and select their own bound
-headers with `lightning_headers`. See [Lightning payments](lightning.md) for the
+headers with `lightning_headers`. Mint receivers require `lightning_protocols l402`.
+See [Lightning payments](lightning.md) for the
 complete syntax and credential paths.
 
 For request controls, see [rate limiting](rate-limiting.md) and

@@ -24,6 +24,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+struct Deposit {
+    invoice: String,
+    amount: u64,
+    pubkey: cdk::nuts::PublicKey,
+    expiry: u64,
+    paid: bool,
+    issued: bool,
+}
+impl Deposit {
+    fn response(&self, id: &str) -> Value {
+        json!({"quote":id, "request":self.invoice,"amount":self.amount,"unit":"sat", "expiry":self.expiry,"pubkey":self.pubkey,
+            "state":if self.issued {"ISSUED"} else if self.paid {"PAID"} else {"UNPAID"},
+            "amount_paid": if self.paid {self.amount} else {0}, "amount_issued":if self.issued {self.amount} else {0},
+            "updated_at": if self.issued {3} else if self.paid {2} else {1}})
+    }
+}
 struct Mint {
     secrets: BTreeMap<Amount, SecretKey>,
     keys: Keys,
@@ -38,6 +54,9 @@ struct Mint {
     leaked_token: AtomicBool,
     payouts: Mutex<Vec<Value>>,
     fail_payout: AtomicBool,
+    deposits: Mutex<HashMap<String, Deposit>>,
+    issuances: AtomicUsize,
+    drop_mint_response: AtomicBool,
 }
 
 impl Mint {
@@ -70,6 +89,9 @@ impl Mint {
             leaked_token: AtomicBool::new(false),
             payouts: Mutex::new(Vec::new()),
             fail_payout: AtomicBool::new(false),
+            deposits: Mutex::new(HashMap::new()),
+            issuances: AtomicUsize::new(0),
+            drop_mint_response: AtomicBool::new(false),
         }
     }
 
@@ -111,8 +133,10 @@ impl Mint {
         }
         if path.starts_with("/backend") {
             self.backend.fetch_add(1, Ordering::SeqCst);
-            self.leaked_token
-                .store(headers.contains_key("x-cashu"), Ordering::SeqCst);
+            self.leaked_token.store(
+                headers.contains_key("x-cashu") || headers.contains_key("authorization"),
+                Ordering::SeqCst,
+            );
             while self.slow.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -123,13 +147,92 @@ impl Mint {
         }
         let result = if path == "/v1/info" {
             json!({"name":"Geata test mint", "nuts": {
-                "4":{"methods":[],"disabled":false}, "5":{"methods":[],"disabled":false},
+                "4":{"methods":[{"method":"bolt11","unit":"sat","min_amount":1,"max_amount":65535}],"disabled":false}, "5":{"methods":[],"disabled":false},
                 "7":{"supported":true},"8":{"supported":true},"9":{"supported":true},"12":{"supported":true}
             }})
         } else if path == "/v1/keysets" {
             json!({"keysets":[{"id":self.id,"unit":"sat","active":true,"input_fee_ppk":1000}]})
         } else if path.starts_with("/v1/keys") {
             json!({"keysets":[{"id":self.id,"unit":"sat","active":true,"input_fee_ppk":1000,"keys":self.keys}]})
+        } else if path == "/v1/mint/quote/bolt11" {
+            use bitcoin::{
+                hashes::{Hash, sha256},
+                secp256k1::{Secp256k1, SecretKey as BitcoinKey},
+            };
+            let data: Value = serde_json::from_slice(body)?;
+            let amount = data["amount"].as_u64().expect("amount");
+            let mut deposits = self.deposits.lock().expect("deposits");
+            let index = deposits.len() + 1;
+            let id = format!("private-quote-{index}");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let invoice =
+                lightning_invoice::InvoiceBuilder::new(lightning_invoice::Currency::Bitcoin)
+                    .amount_milli_satoshis(amount * 1000)
+                    .description("Cashu deposit".into())
+                    .payment_hash(sha256::Hash::hash(&[index as u8; 32]))
+                    .payment_secret(lightning_invoice::PaymentSecret([9; 32]))
+                    .duration_since_epoch(Duration::from_secs(now))
+                    .expiry_time(Duration::from_secs(300))
+                    .min_final_cltv_expiry_delta(18)
+                    .build_signed(|message| {
+                        Secp256k1::new().sign_ecdsa_recoverable(
+                            message,
+                            &BitcoinKey::from_slice(&[7; 32]).expect("key"),
+                        )
+                    })?;
+            let deposit = Deposit {
+                invoice: invoice.to_string(),
+                amount,
+                pubkey: serde_json::from_value(data["pubkey"].clone())?,
+                expiry: now + 300,
+                paid: false,
+                issued: false,
+            };
+            let response = deposit.response(&id);
+            deposits.insert(id, deposit);
+            response
+        } else if let Some(id) = path.strip_prefix("/v1/mint/quote/bolt11/") {
+            self.deposits
+                .lock()
+                .expect("deposits")
+                .get(id)
+                .expect("quote")
+                .response(id)
+        } else if path == "/v1/mint/bolt11" {
+            let data: cdk::nuts::MintRequest<String> = serde_json::from_slice(body)?;
+            let mut deposits = self.deposits.lock().expect("deposits");
+            let deposit = deposits.get_mut(&data.quote).expect("quote");
+            data.verify_signature(deposit.pubkey)?;
+            anyhow::ensure!(
+                deposit.paid && !deposit.issued,
+                "quote must be paid and unissued"
+            );
+            let total: u64 = data
+                .outputs
+                .iter()
+                .map(|output| u64::from(output.amount))
+                .sum();
+            anyhow::ensure!(total == deposit.amount, "mint amount mismatch");
+            let mut signatures = vec![];
+            for output in data.outputs {
+                let key = &self.secrets[&output.amount];
+                let c = dhke::sign_message(key, &output.blinded_secret)?;
+                let signature =
+                    BlindSignature::new(output.amount, c, self.id, &output.blinded_secret, key)?;
+                self.signed.lock().expect("signatures").insert(
+                    output.blinded_secret.to_string(),
+                    (serde_json::to_value(output)?, signature.clone()),
+                );
+                signatures.push(signature);
+            }
+            deposit.issued = true;
+            self.issuances.fetch_add(1, Ordering::SeqCst);
+            if self.drop_mint_response.swap(false, Ordering::SeqCst) {
+                return Ok(None);
+            }
+            json!({"signatures":signatures})
         } else if path == "/v1/swap" {
             let data: Value = serde_json::from_slice(body)?;
             let inputs: Vec<Proof> = serde_json::from_value(data["inputs"].clone())?;
@@ -293,7 +396,10 @@ fn start(root: &Path, http: u16, https: u16) -> anyhow::Result<Proxy> {
         .append(true)
         .open(root.join("proxy.log"))?;
     let child = Command::new(env!("CARGO_BIN_EXE_geata"))
-        .env("RUST_LOG", "pingora_proxy=trace,geata=info")
+        .env(
+            "RUST_LOG",
+            "pingora_proxy=trace,geata=info,cdk=trace,cdk_http_client=trace,cashu=trace",
+        )
         .args(["run", "--config"])
         .arg(root.join("Geatafile"))
         .arg("--data-dir")
@@ -334,7 +440,11 @@ fn request(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n"
     )?;
     if let Some(token) = token {
-        write!(stream, "X-Cashu: {token}\r\n")?;
+        if token.starts_with("L402 ") {
+            write!(stream, "Authorization: {token}\r\n")?;
+        } else {
+            write!(stream, "X-Cashu: {token}\r\n")?;
+        }
     }
     write!(stream, "\r\n")?;
     let mut response = String::new();
@@ -846,5 +956,141 @@ fn expire_payout_timer(root: &Path) -> anyhow::Result<()> {
         table.insert("state", serde_json::to_string(&state)?.as_str())?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+#[test]
+fn l402_receives_into_cashu_and_recovers_minting_across_restart() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mint = Arc::new(Mint::new(true));
+    let server = Server::start(mint.clone())?;
+    let mint_url = format!("http://127.0.0.1:{}", server.port);
+    let (hp, tp) = (port()?, port()?);
+    std::fs::write(
+        root.path().join("Geatafile"),
+        format!(
+            r#"
+lightning mint {{ mint {mint_url} network mainnet }}
+http://ready.local {{ respond ready }}
+http://localhost {{
+    rate_limit 1/s burst 1
+    pay_over_limit 2 sat {mint_url}
+    lightning_over_limit 8 sat mint
+    lightning_protocols l402
+    lightning_headers none
+    max_inflight 1
+    reverse_proxy 127.0.0.1:{}
+}}
+"#,
+            server.port
+        ),
+    )?;
+    let mut proxy = Some(start(root.path(), hp, tp)?);
+    let challenge = || -> anyhow::Result<String> {
+        // Consume any refilled free allowance before taking the challenge.
+        let mut response = settled_request(hp, "localhost", "/backend", None)?;
+        if response.0 == 200 {
+            response = settled_request(hp, "localhost", "/backend", None)?;
+        }
+        assert_eq!(response.0, 402, "{}", response.2);
+        assert!(response.1.contains_key("x-cashu"));
+        assert!(!response.1.contains_key("payment-required"));
+        let auth = response.1.get("www-authenticate").expect("L402 challenge");
+        assert!(!auth.contains("private-quote"));
+        let token = auth
+            .strip_prefix("L402 macaroon=\"")
+            .expect("scheme")
+            .split('"')
+            .next()
+            .expect("macaroon");
+        let index = mint.deposits.lock().expect("deposits").len() as u8;
+        let preimage: String = [index; 32]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(format!("L402 {token}:{preimage}"))
+    };
+    let proof = challenge()?;
+    assert_eq!(
+        settled_request(hp, "localhost", "/different", Some(&proof))?.0,
+        401
+    );
+    // Knowing a preimage does not bypass receipt of Cashu funds from the mint.
+    assert_eq!(
+        settled_request(hp, "localhost", "/backend", Some(&proof))?.0,
+        503
+    );
+    mint.deposits
+        .lock()
+        .expect("deposits")
+        .get_mut("private-quote-1")
+        .expect("quote")
+        .paid = true;
+    mint.offline.store(true, Ordering::SeqCst);
+    assert_eq!(
+        settled_request(hp, "localhost", "/backend", Some(&proof))?.0,
+        503
+    );
+    mint.offline.store(false, Ordering::SeqCst);
+    mint.drop_mint_response.store(true, Ordering::SeqCst);
+    assert_eq!(
+        settled_request(hp, "localhost", "/backend", Some(&proof))?.0,
+        503
+    );
+    assert_eq!(mint.issuances.load(Ordering::SeqCst), 1);
+    let log = std::fs::read_to_string(root.path().join("proxy.log"))?;
+    assert!(
+        !log.contains("private-quote-1") && !log.contains(&proof),
+        "payment credentials reached logs"
+    );
+    drop(proxy.take());
+    proxy = Some(start(root.path(), hp, tp)?);
+    // Startup recovery and an HTTP retry may contend for the wallet briefly.
+    eventually(|| Ok(settled_request(hp, "localhost", "/backend", Some(&proof))?.0 == 200))?;
+    assert_eq!(
+        settled_request(hp, "localhost", "/backend", Some(&proof))?.0,
+        401
+    );
+    assert_eq!(mint.issuances.load(Ordering::SeqCst), 1);
+    assert!(!mint.leaked_token.load(Ordering::SeqCst));
+    let direct = mint.token(&mint_url, 4)?;
+    assert_eq!(
+        settled_request(hp, "localhost", "/backend", Some(&direct))?.0,
+        200
+    );
+    // Paid invoices are claimed even if the customer never retries, including
+    // after restart with the receiving site removed from the configuration.
+    let _unused = challenge()?;
+    mint.deposits
+        .lock()
+        .expect("deposits")
+        .get_mut("private-quote-2")
+        .expect("quote")
+        .paid = true;
+    drop(proxy.take());
+    std::fs::write(
+        root.path().join("Geatafile"),
+        "http://ready.local { respond ready }",
+    )?;
+    proxy = Some(start(root.path(), hp, tp)?);
+    eventually(|| Ok(mint.issuances.load(Ordering::SeqCst) == 2))?;
+    // Wait until issued funds have been saved locally, not just signed remotely.
+    thread::sleep(Duration::from_millis(200));
+    drop(proxy.take());
+    let balance = Command::new(env!("CARGO_BIN_EXE_geata"))
+        .args(["wallet", "--mint", &mint_url, "--data-dir"])
+        .arg(root.path().join("state"))
+        .arg("balance")
+        .output()?;
+    assert!(
+        balance.status.success(),
+        "{}",
+        String::from_utf8_lossy(&balance.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&balance.stdout).contains("19 sat"),
+        "{}",
+        String::from_utf8_lossy(&balance.stdout)
+    );
     Ok(())
 }

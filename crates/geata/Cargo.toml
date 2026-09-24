@@ -14,6 +14,7 @@ path = "src/main.rs"
 base64.workspace = true
 bitcoin.workspace = true
 lightning-invoice.workspace = true
+macaroon.workspace = true
 prost.workspace = true
 http-body-util.workspace = true
 rustls-pemfile.workspace = true

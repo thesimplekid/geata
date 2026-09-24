@@ -1,5 +1,6 @@
 mod ledger;
 pub mod lightning;
+mod minting;
 pub mod payout;
 
 use std::{
@@ -110,6 +111,7 @@ struct MintWallet {
     wallet: Wallet,
     ledger: Ledger,
     needs_recovery: bool,
+    deposit_cursor: Option<String>,
 }
 
 impl Payments {
@@ -256,6 +258,7 @@ impl MintWallet {
             )?,
             ledger,
             needs_recovery: true,
+            deposit_cursor: None,
         })
     }
 

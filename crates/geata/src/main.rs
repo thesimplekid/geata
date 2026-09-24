@@ -118,8 +118,12 @@ fn main() -> anyhow::Result<()> {
     // level disabled even when broad dependency tracing is requested so bearer
     // tokens, cookies, and authorization credentials cannot enter logs.
     let safe_dependencies = filter_fn(|metadata| {
-        metadata.level() != &tracing::Level::TRACE
-            || !metadata.target().starts_with("pingora_proxy")
+        // Wallet dependency events can contain private mint quote IDs, responses,
+        // or token material. Geata reports their failures without those details.
+        !metadata.target().starts_with("cdk")
+            && !metadata.target().starts_with("cashu")
+            && (metadata.level() != &tracing::Level::TRACE
+                || !metadata.target().starts_with("pingora_proxy"))
     });
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(requested.and(safe_dependencies)))
@@ -216,7 +220,14 @@ fn main() -> anyhow::Result<()> {
             let storage = Arc::new(Storage::open(&data_dir, &directory_url)?);
             let mut state = State::new(parsed);
             state.payments = Some(Arc::new(payments::Payments::new(&data_dir)));
-            state.lightning = Some(Arc::new(payments::lightning::Lightning::new(&data_dir)));
+            state.lightning = Some(Arc::new(payments::lightning::Lightning::new(
+                &data_dir,
+                state
+                    .payments
+                    .as_ref()
+                    .expect("payments initialized")
+                    .clone(),
+            )));
             let state = Arc::new(state);
             // Populate before accepting connections, so restart reuses certificates immediately.
             for domain in state.config.load().https_domains() {

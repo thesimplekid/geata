@@ -40,11 +40,23 @@ impl BackgroundService for Automation {
             _ = self.watch_config() => {},
             _ = self.manage_certificates() => {},
             _ = self.manage_payouts() => {},
+            _ = self.manage_cashu_deposits() => {},
         }
     }
 }
 
 impl Automation {
+    async fn manage_cashu_deposits(&self) {
+        loop {
+            if let Some(lightning) = &self.state.lightning
+                && lightning.recover_cashu_deposits().await.is_err()
+            {
+                tracing::warn!("Cashu L402 deposit recovery unavailable");
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    }
+
     async fn manage_payouts(&self) {
         loop {
             if let Some(payments) = &self.state.payments {

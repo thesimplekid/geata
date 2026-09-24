@@ -10,7 +10,7 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use openssl::{hash::MessageDigest, pkey::PKey, sign::Signer};
 use prost::Message;
 
-use super::{ReceiverConfig, hex, now};
+use super::{LdkReceiverConfig, hex, now};
 
 #[derive(Clone, PartialEq, Message)]
 struct ReceiveRequest {
@@ -45,7 +45,7 @@ fn read_bounded(path: &Path, max: usize) -> anyhow::Result<Vec<u8>> {
 }
 
 pub(super) async fn invoice(
-    config: &ReceiverConfig,
+    config: &LdkReceiverConfig,
     amount: u64,
     hash: &str,
 ) -> anyhow::Result<String> {

@@ -31,11 +31,15 @@
             src = craneLib.cleanCargoSource ./.;
             strictDeps = true;
             OPENSSL_NO_VENDOR = "1";
+            SODIUM_USE_PKG_CONFIG = "1";
             nativeBuildInputs = [
               pkgs.pkg-config
               pkgs.cmake
             ];
-            buildInputs = [ pkgs.openssl ];
+            buildInputs = [
+              pkgs.openssl
+              pkgs.libsodium
+            ];
           };
           cargoArtifacts = craneLib.buildDepsOnly common;
           args = common // {
@@ -92,6 +96,7 @@
       devShells = eachSystem (pkgs: {
         default = pkgs.mkShell {
           OPENSSL_NO_VENDOR = "1";
+          SODIUM_USE_PKG_CONFIG = "1";
           packages = with pkgs; [
             rustc
             cargo
@@ -101,6 +106,7 @@
             pkg-config
             cmake
             openssl
+            libsodium
             just
             python3
             nodejs

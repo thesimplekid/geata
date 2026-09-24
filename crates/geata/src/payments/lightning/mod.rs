@@ -1,4 +1,6 @@
 //! x402 v2 exact/lnbtc, HTTP request binding and local upfront settlement.
+mod cashu;
+mod l402;
 mod receiver;
 
 use anyhow::{Context, ensure};
@@ -23,7 +25,7 @@ pub const MAX_PAYMENT_HEADER: usize = 24 * 1024;
 pub const MAX_BODY: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
-pub struct ReceiverConfig {
+pub struct LdkReceiverConfig {
     pub endpoint: String,
     pub api_key_file: PathBuf,
     pub tls_cert_file: PathBuf,
@@ -33,12 +35,95 @@ pub struct ReceiverConfig {
 }
 
 #[derive(Clone, Debug)]
+pub enum ReceiverConfig {
+    Ldk(LdkReceiverConfig),
+    Cashu {
+        mint: cdk::mint_url::MintUrl,
+        network: String,
+    },
+}
+impl ReceiverConfig {
+    pub fn network(&self) -> &str {
+        match self {
+            Self::Ldk(node) => &node.network,
+            Self::Cashu { network, .. } => network,
+        }
+    }
+    pub fn ldk(&self) -> Option<&LdkReceiverConfig> {
+        match self {
+            Self::Ldk(node) => Some(node),
+            _ => None,
+        }
+    }
+    pub fn mint(&self) -> Option<&cdk::mint_url::MintUrl> {
+        match self {
+            Self::Cashu { mint, .. } => Some(mint),
+            _ => None,
+        }
+    }
+    fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Ldk(node) => node.validate(),
+            Self::Cashu { mint, network } => {
+                super::parse_mint(&mint.to_string())?;
+                ensure!(
+                    matches!(network.as_str(), MAINNET | TESTNET),
+                    "unsupported mint network"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Policy {
     pub amount_msat: u64,
     pub receiver: ReceiverConfig,
     pub origin: String,
     pub headers: Vec<String>,
+    pub protocols: Protocols,
 }
+#[derive(Clone, Debug)]
+pub struct Protocols {
+    pub x402: bool,
+    pub l402: bool,
+}
+impl Default for Protocols {
+    fn default() -> Self {
+        Self {
+            x402: true,
+            l402: false,
+        }
+    }
+}
+impl Protocols {
+    pub fn parse(names: &[&str]) -> anyhow::Result<Self> {
+        ensure!(
+            !names.is_empty(),
+            "lightning_protocols requires x402, l402, or both"
+        );
+        let mut protocols = Self {
+            x402: false,
+            l402: false,
+        };
+        for name in names {
+            let enabled = match *name {
+                "x402" => &mut protocols.x402,
+                "l402" => &mut protocols.l402,
+                _ => anyhow::bail!("unknown Lightning protocol: {name}"),
+            };
+            ensure!(!*enabled, "duplicate Lightning protocol: {name}");
+            *enabled = true;
+        }
+        Ok(protocols)
+    }
+}
+pub struct Challenge {
+    pub x402: Option<String>,
+    pub l402: Option<String>,
+}
+
 impl Policy {
     pub fn new(
         price: &str,
@@ -46,6 +131,7 @@ impl Policy {
         receiver: ReceiverConfig,
         origin: String,
         headers: Vec<String>,
+        protocols: Protocols,
     ) -> anyhow::Result<Self> {
         ensure!(
             !price.is_empty() && price.bytes().all(|b| b.is_ascii_digit()),
@@ -64,6 +150,7 @@ impl Policy {
             receiver,
             origin,
             headers,
+            protocols,
         };
         policy.validate_binding()?;
         Ok(policy)
@@ -79,11 +166,19 @@ impl Policy {
     pub fn requirements(&self, hash: String, invoice: String) -> Requirements {
         Requirements {
             scheme: "exact".into(),
-            network: self.receiver.network.clone(),
+            network: self.receiver.network().to_owned(),
             amount: self.amount_msat.to_string(),
             asset: "BTC".into(),
-            pay_to: self.receiver.pay_to.clone(),
-            max_timeout_seconds: self.receiver.expiry_seconds,
+            pay_to: self
+                .receiver
+                .ldk()
+                .map(|node| node.pay_to.clone())
+                .unwrap_or_default(),
+            max_timeout_seconds: self
+                .receiver
+                .ldk()
+                .map(|node| node.expiry_seconds)
+                .unwrap_or_default(),
             extra: Extra {
                 asset_transfer_method: Some("bolt11".into()),
                 payment_flow: "upfront".into(),
@@ -108,7 +203,8 @@ impl ReceiverConfig {
             ensure!(
                 matches!(
                     pair[0],
-                    "endpoint"
+                    "mint"
+                        | "endpoint"
                         | "api_key_file"
                         | "tls_cert_file"
                         | "pay_to"
@@ -135,7 +231,17 @@ impl ReceiverConfig {
             "testnet" => TESTNET,
             _ => anyhow::bail!("Lightning network must be mainnet or testnet"),
         };
-        let receiver = Self {
+        if let Some(mint) = fields.get("mint") {
+            ensure!(
+                fields.keys().all(|key| matches!(*key, "mint" | "network")),
+                "Cashu receivers accept only mint and network; do not mix LDK settings"
+            );
+            return Ok(Self::Cashu {
+                mint: super::parse_mint(mint)?,
+                network: network.into(),
+            });
+        }
+        let receiver = LdkReceiverConfig {
             endpoint: required("endpoint")?.into(),
             api_key_file: required("api_key_file")?.into(),
             tls_cert_file: required("tls_cert_file")?.into(),
@@ -146,9 +252,10 @@ impl ReceiverConfig {
                 .map_or(Ok(300), |value| value.parse::<u32>())?,
         };
         receiver.validate()?;
-        Ok(receiver)
+        Ok(Self::Ldk(receiver))
     }
-
+}
+impl LdkReceiverConfig {
     fn validate(&self) -> anyhow::Result<()> {
         let endpoint = url::Url::parse(&self.endpoint)?;
         ensure!(
@@ -184,6 +291,14 @@ impl ReceiverConfig {
 }
 impl Policy {
     fn validate_binding(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.receiver.mint().is_none() || (self.protocols.l402 && !self.protocols.x402),
+            "Cashu receivers require lightning_protocols l402; Lightning x402 requires LDK Server"
+        );
+        ensure!(
+            !self.protocols.l402 || !self.headers.iter().any(|h| h == "authorization"),
+            "L402 reserves Authorization for payment; remove authorization from lightning_headers and use a bound cookie or custom header for backend authentication"
+        );
         let origin = url::Url::parse(&self.origin)?;
         ensure!(
             matches!(origin.scheme(), "http" | "https")
@@ -334,13 +449,15 @@ fn validate_invoice(
 ) -> anyhow::Result<Bolt11Invoice> {
     let invoice: Bolt11Invoice = encoded.parse().context("invalid BOLT11 invoice")?;
     invoice.check_signature()?;
-    ensure!(
-        invoice.recover_payee_pub_key().to_string() == policy.receiver.pay_to,
-        "invoice receiver mismatch"
-    );
+    if let Some(node) = policy.receiver.ldk() {
+        ensure!(
+            invoice.recover_payee_pub_key().to_string() == node.pay_to,
+            "invoice receiver mismatch"
+        );
+    }
     ensure!(
         invoice.currency()
-            == if policy.receiver.network == MAINNET {
+            == if policy.receiver.network() == MAINNET {
                 Currency::Bitcoin
             } else {
                 Currency::BitcoinTestnet
@@ -351,17 +468,19 @@ fn validate_invoice(
         invoice.amount_milli_satoshis() == Some(policy.amount_msat),
         "invoice amount mismatch"
     );
-    match invoice.description() {
-        Bolt11InvoiceDescriptionRef::Hash(h) => ensure!(
-            h.0.to_byte_array() == decode_hash(hash)?,
-            "invoice request mismatch"
-        ),
-        _ => anyhow::bail!("invoice needs a description hash"),
+    if let Some(node) = policy.receiver.ldk() {
+        match invoice.description() {
+            Bolt11InvoiceDescriptionRef::Hash(h) => ensure!(
+                h.0.to_byte_array() == decode_hash(hash)?,
+                "invoice request mismatch"
+            ),
+            _ => anyhow::bail!("invoice needs a description hash"),
+        }
+        ensure!(
+            invoice.expiry_time().as_secs() == u64::from(node.expiry_seconds),
+            "invoice expiry mismatch"
+        );
     }
-    ensure!(
-        invoice.expiry_time().as_secs() == u64::from(policy.receiver.expiry_seconds),
-        "invoice expiry mismatch"
-    );
     let created = invoice.duration_since_epoch().as_secs();
     ensure!(
         created <= time.saturating_add(SKEW),
@@ -383,6 +502,10 @@ fn verify(
     encoded: &str,
     time: u64,
 ) -> anyhow::Result<(String, String, u64)> {
+    ensure!(
+        policy.receiver.ldk().is_some(),
+        "Lightning x402 requires LDK Server"
+    );
     ensure!(encoded.len() <= MAX_PAYMENT_HEADER, "payment too large");
     let payment: Payment = serde_json::from_slice(&STANDARD.decode(encoded)?)?;
     ensure!(payment.x402_version == 2, "unsupported x402 version");
@@ -402,7 +525,7 @@ fn verify(
         "invalid payment proof"
     );
     let payment_hash = invoice.payment_hash().to_string();
-    let key = format!("{}:{payment_hash}", policy.receiver.network);
+    let key = format!("{}:{payment_hash}", policy.receiver.network());
     let retain_until = invoice
         .duration_since_epoch()
         .as_secs()
@@ -421,14 +544,16 @@ pub enum Error {
 
 pub struct Lightning {
     path: PathBuf,
+    payments: Arc<super::Payments>,
     database: Mutex<Option<Arc<Database>>>,
     // Limit invoice creation independently of free-request quotas, across reloads.
     issuance: crate::rate_limit::RateLimiter,
 }
 impl Lightning {
-    pub fn new(data: &Path) -> Self {
+    pub fn new(data: &Path, payments: Arc<super::Payments>) -> Self {
         Self {
             path: data.join("lightning").join("settlements.redb"),
+            payments,
             database: Mutex::new(None),
             issuance: crate::rate_limit::RateLimiter::new(crate::rate_limit::Limit {
                 per_second: 1,
@@ -442,19 +567,33 @@ impl Lightning {
         url: &str,
         hash: &str,
         client: std::net::IpAddr,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Challenge> {
         ensure!(
             self.issuance.check(client).is_ok(),
             "invoice issuance rate exceeded"
         );
         // Establish durable storage before asking anyone to pay.
         self.database().await?;
-        let invoice = receiver::invoice(&policy.receiver, policy.amount_msat, hash).await?;
-        validate_invoice(policy, hash, &invoice, now()?, 0)?;
-        Ok(STANDARD.encode(serde_json::to_vec(&json!({
-            "x402Version": 2, "resource": {"url": url},
-            "accepts": [policy.requirements(hash.to_owned(), invoice)]
-        }))?))
+        let invoice = match &policy.receiver {
+            ReceiverConfig::Ldk(node) => receiver::invoice(node, policy.amount_msat, hash).await?,
+            ReceiverConfig::Cashu { mint, .. } => self.cashu_invoice(policy, mint, hash).await?,
+        };
+        let parsed = validate_invoice(policy, hash, &invoice, now()?, 0)?;
+        let l402 = if policy.protocols.l402 {
+            Some(self.mint_l402(policy, hash, &invoice, &parsed).await?)
+        } else {
+            None
+        };
+        let x402 = policy.protocols.x402.then(|| {
+            STANDARD.encode(
+                json!({
+                    "x402Version": 2, "resource": {"url": url},
+                    "accepts": [policy.requirements(hash.to_owned(), invoice)]
+                })
+                .to_string(),
+            )
+        });
+        Ok(Challenge { x402, l402 })
     }
     async fn database(&self) -> anyhow::Result<Arc<Database>> {
         let mut guard = self.database.lock().await;
@@ -470,6 +609,9 @@ impl Lightning {
             let mut tx = db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             tx.open_table(SPENT)?;
+            tx.open_table(l402::ROOTS)?;
+            tx.open_table(cashu::QUOTES)?;
+            tx.open_table(cashu::MINTS)?;
             tx.commit()?;
             std::fs::File::open(parent)?.sync_all()?;
             Ok(db)
@@ -488,6 +630,12 @@ impl Lightning {
         let time = now().map_err(|_| Error::Unavailable)?;
         let (key, payment_hash, retain_until) =
             verify(policy, hash, encoded, time).map_err(|_| Error::Invalid)?;
+        self.claim(key, retain_until).await?;
+        let response = json!({"success": true, "transaction": payment_hash, "network": policy.receiver.network()});
+        Ok(STANDARD.encode(response.to_string()))
+    }
+
+    async fn claim(&self, key: String, retain_until: u64) -> Result<(), Error> {
         let db = self.database().await.map_err(|_| Error::Unavailable)?;
         let claimed = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let mut tx = db.begin_write()?;
@@ -510,9 +658,8 @@ impl Lightning {
         if !claimed {
             return Err(Error::Invalid);
         }
-        // Entries are retained indefinitely. They may only be pruned after retain_until.
-        let response = json!({"success": true, "transaction": payment_hash, "network": policy.receiver.network});
-        Ok(STANDARD.encode(response.to_string()))
+        // Both protocols consume the same network:payment_hash key.
+        Ok(())
     }
 }
 
@@ -525,22 +672,23 @@ mod tests {
     };
     use lightning_invoice::{InvoiceBuilder, PaymentSecret};
 
-    fn policy() -> Policy {
+    pub(super) fn policy() -> Policy {
         Policy {
             amount_msat: 25000,
             origin: "https://api.example.com".into(),
             headers: vec![],
-            receiver: ReceiverConfig {
+            protocols: Protocols::default(),
+            receiver: ReceiverConfig::Ldk(LdkReceiverConfig {
                 endpoint: "https://localhost:3536".into(),
                 api_key_file: "/receiver/api_key".into(),
                 tls_cert_file: "/receiver/tls.crt".into(),
                 pay_to: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
                 network: MAINNET.into(),
                 expiry_seconds: 300,
-            },
+            }),
         }
     }
-    fn signed(policy: &Policy, hash: &str, time: u64) -> String {
+    pub(super) fn signed(policy: &Policy, hash: &str, time: u64) -> String {
         let mut key = [0; 32];
         key[31] = 1;
         let key = SecretKey::from_slice(&key).expect("test key");
@@ -553,14 +701,14 @@ mod tests {
             .payment_secret(PaymentSecret([7; 32]))
             .duration_since_epoch(std::time::Duration::from_secs(time))
             .expiry_time(std::time::Duration::from_secs(u64::from(
-                policy.receiver.expiry_seconds,
+                policy.receiver.ldk().expect("LDK").expiry_seconds,
             )))
             .min_final_cltv_expiry_delta(18)
             .build_signed(|msg| Secp256k1::new().sign_ecdsa_recoverable(msg, &key))
             .expect("invoice")
             .to_string()
     }
-    fn payment(policy: &Policy, hash: &str, time: u64) -> serde_json::Value {
+    pub(super) fn payment(policy: &Policy, hash: &str, time: u64) -> serde_json::Value {
         json!({"x402Version": 2, "accepted": policy.requirements(hash.into(), signed(policy, hash, time)), "payload": {"preimage": hex(&[42; 32])}})
     }
     fn encoded(value: &serde_json::Value) -> String {
@@ -671,7 +819,10 @@ mod tests {
     #[tokio::test]
     async fn concurrent_settlement_is_single_use_across_restart() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let lightning = Lightning::new(root.path());
+        let lightning = Lightning::new(
+            root.path(),
+            Arc::new(super::super::Payments::new(root.path())),
+        );
         let p = policy();
         let hash = digest(b"request");
         let value = encoded(&payment(&p, &hash, now()?));
@@ -684,7 +835,10 @@ mod tests {
         assert_eq!(receipt["network"], MAINNET);
         assert!(receipt.get("payer").is_none());
         drop(lightning);
-        let lightning = Lightning::new(root.path());
+        let lightning = Lightning::new(
+            root.path(),
+            Arc::new(super::super::Payments::new(root.path())),
+        );
         assert!(matches!(
             lightning.settle(&p, &hash, &value).await,
             Err(Error::Invalid)
@@ -717,14 +871,17 @@ mod tests {
             .lightning
             .as_ref()
             .expect("policy");
-        assert_eq!(first.receiver.endpoint, second.receiver.endpoint);
+        assert_eq!(
+            first.receiver.ldk().expect("LDK").endpoint,
+            second.receiver.ldk().expect("LDK").endpoint
+        );
         assert_eq!(first.origin, "https://api.example.com");
         assert_eq!(first.headers, ["authorization", "content-type"]);
         assert_eq!(second.origin, "http://localhost:8080");
         assert!(second.headers.is_empty());
         assert_eq!(first.amount_msat, 25000);
         assert_eq!(second.amount_msat, 2000);
-        assert_eq!(first.receiver.expiry_seconds, 300);
+        assert_eq!(first.receiver.ldk().expect("LDK").expiry_seconds, 300);
         let testnet = crate::config::Config::parse(&format!(
             "{} api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_over_limit 1 sat node lightning_headers none }}",
             receiver_block().replace("network mainnet", "network testnet expiry_seconds 600")
@@ -733,8 +890,71 @@ mod tests {
             .lightning
             .as_ref()
             .expect("testnet");
-        assert_eq!(policy.receiver.network, TESTNET);
-        assert_eq!(policy.receiver.expiry_seconds, 600);
+        assert_eq!(policy.receiver.network(), TESTNET);
+        assert_eq!(policy.receiver.ldk().expect("LDK").expiry_seconds, 600);
+        Ok(())
+    }
+
+    #[test]
+    fn lightning_protocol_selection() -> anyhow::Result<()> {
+        for (directive, x402, l402) in [
+            ("", true, false),
+            ("lightning_protocols x402", true, false),
+            ("lightning_protocols l402", false, true),
+            ("lightning_protocols x402 l402", true, true),
+        ] {
+            let config = crate::config::Config::parse(&format!(
+                "{} api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_over_limit 25 sat node lightning_headers cookie {directive} }}",
+                receiver_block()
+            ))?;
+            let protocols = &config.sites["api.example.com"]
+                .lightning
+                .as_ref()
+                .expect("policy")
+                .protocols;
+            assert_eq!((protocols.x402, protocols.l402), (x402, l402));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cashu_receivers_require_l402_and_reject_mixed_backend_settings() -> anyhow::Result<()> {
+        let block = "lightning mint { mint https://mint.example.com network mainnet }";
+        let site = "api.example.com { respond ok rate_limit 1/s burst 1 lightning_over_limit 8 sat mint lightning_headers cookie lightning_protocols l402 }";
+        let config = crate::config::Config::parse(&format!("{site} {block}"))?;
+        let policy = config.sites["api.example.com"]
+            .lightning
+            .as_ref()
+            .expect("policy");
+        assert!(policy.receiver.mint().is_some());
+        assert_eq!(policy.receiver.network(), MAINNET);
+        for invalid in [
+            block.replace(
+                "mint https://mint.example.com",
+                "mint http://mint.example.com",
+            ),
+            block.replace("network mainnet", "network regtest"),
+            block.replace("network mainnet", ""),
+            block.replace(
+                "network mainnet",
+                "network mainnet endpoint https://localhost:3536",
+            ),
+            block.replace("network mainnet", "network mainnet pay_to 00"),
+            block.replace("network mainnet", "network mainnet expiry_seconds 300"),
+        ] {
+            assert!(
+                crate::config::Config::parse(&format!("{site} {invalid}")).is_err(),
+                "{invalid}"
+            );
+        }
+        for protocols in [
+            "",
+            "lightning_protocols x402",
+            "lightning_protocols x402 l402",
+        ] {
+            let site = site.replace("lightning_protocols l402", protocols);
+            assert!(crate::config::Config::parse(&format!("{site} {block}")).is_err());
+        }
         Ok(())
     }
 
@@ -763,6 +983,12 @@ mod tests {
             "lightning_over_limit 25 sat missing lightning_headers none",
             "lightning_over_limit 25 sat node",
             "lightning_headers none",
+            "lightning_protocols l402",
+            "lightning_over_limit 25 sat node lightning_headers none lightning_protocols",
+            "lightning_over_limit 25 sat node lightning_headers none lightning_protocols other",
+            "lightning_over_limit 25 sat node lightning_headers none lightning_protocols x402 x402",
+            "lightning_over_limit 25 sat node lightning_headers none lightning_protocols l402 lightning_protocols x402",
+            "lightning_over_limit 25 sat node lightning_headers authorization lightning_protocols l402",
             "lightning_origin https://api.example.com",
             "lightning_over_limit 0 sat node lightning_headers none",
             "lightning_over_limit 25 msat node lightning_headers none",
@@ -801,7 +1027,10 @@ mod tests {
             .lightning
             .as_ref()
             .expect("policy");
-        assert_eq!(policy.receiver.endpoint, "https://localhost:3537");
+        assert_eq!(
+            policy.receiver.ldk().expect("LDK").endpoint,
+            "https://localhost:3537"
+        );
         assert_eq!(policy.headers, ["authorization"]);
         Ok(())
     }

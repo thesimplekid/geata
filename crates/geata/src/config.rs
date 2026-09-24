@@ -290,6 +290,7 @@ fn parse_directives(
     let mut lightning = None;
     let mut lightning_headers = None;
     let mut lightning_origin = None;
+    let mut lightning_protocols = None;
     let mut max_inflight = None;
     let mut cursor = 0;
     while cursor < tokens.len() {
@@ -299,7 +300,7 @@ fn parse_directives(
             Some("reverse_proxy") => 2,
             Some("rate_limit" | "pay_over_limit" | "lightning_over_limit") => 4,
             Some("max_inflight" | "lightning_origin") => 2,
-            Some("lightning_headers") => {
+            Some("lightning_headers" | "lightning_protocols") => {
                 1 + tokens[start + 1..]
                     .iter()
                     .take_while(|token| token.quoted || !site_directive(token.text()))
@@ -336,6 +337,16 @@ fn parse_directives(
                     args[3].text().unwrap_or_default(),
                     line,
                 ));
+            }
+            Some("lightning_protocols") => {
+                if lightning_protocols.is_some() {
+                    return Err(error("duplicate lightning_protocols directive"));
+                }
+                let names: Vec<_> = args[1..].iter().filter_map(Token::text).collect();
+                lightning_protocols = Some(
+                    crate::payments::lightning::Protocols::parse(&names)
+                        .map_err(|e| error(&e.to_string()))?,
+                );
             }
             Some("lightning_headers") => {
                 if lightning_headers.is_some() {
@@ -441,7 +452,7 @@ fn parse_directives(
             }
             _ => {
                 return Err(error(
-                    "unknown directive; expected reverse_proxy, respond, rate_limit, pay_over_limit, lightning_over_limit, lightning_headers, lightning_origin, or max_inflight",
+                    "unknown directive; expected reverse_proxy, respond, rate_limit, pay_over_limit, lightning_over_limit, lightning_headers, lightning_origin, lightning_protocols, or max_inflight",
                 ));
             }
         }
@@ -473,14 +484,18 @@ fn parse_directives(
                     receiver.clone(),
                     origin,
                     headers,
+                    lightning_protocols.unwrap_or_default(),
                 )
                 .map_err(|e| error(&e.to_string()))?,
             )
         }
         None => {
-            if lightning_headers.is_some() || lightning_origin.is_some() {
+            if lightning_headers.is_some()
+                || lightning_origin.is_some()
+                || lightning_protocols.is_some()
+            {
                 return Err(error(
-                    "lightning_headers and lightning_origin require lightning_over_limit",
+                    "lightning_headers, lightning_origin, and lightning_protocols require lightning_over_limit",
                 ));
             }
             None
@@ -499,6 +514,7 @@ fn site_directive(value: Option<&str>) -> bool {
                 | "pay_over_limit"
                 | "lightning_over_limit"
                 | "lightning_headers"
+                | "lightning_protocols"
                 | "lightning_origin"
                 | "max_inflight"
         )

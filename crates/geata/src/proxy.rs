@@ -136,6 +136,54 @@ impl ProxyHttp for Proxy {
                 }
             }
         }
+        let l402_enabled = site.lightning.as_ref().is_some_and(|p| p.protocols.l402);
+        let l402_header = if l402_enabled {
+            let values = session.req_header().headers.get_all("authorization");
+            match values.iter().next() {
+                Some(value) => {
+                    let credential = value
+                        .to_str()
+                        .ok()
+                        .and_then(|value| value.split_once(' '))
+                        .filter(|(scheme, credential)| {
+                            scheme.eq_ignore_ascii_case("L402")
+                                && !credential.is_empty()
+                                && credential.len()
+                                    <= crate::payments::lightning::MAX_PAYMENT_HEADER
+                        });
+                    if values.iter().count() != 1 || credential.is_none() {
+                        return respond_with_headers(
+                            session,
+                            401,
+                            "This site requires an L402 Authorization credential.\n",
+                            &[("Cache-Control", "no-store"), ("WWW-Authenticate", "L402")],
+                        )
+                        .await;
+                    }
+                    Some(credential.expect("checked credential").1.to_owned())
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if l402_header.is_some()
+            && (session
+                .req_header()
+                .headers
+                .contains_key("payment-signature")
+                || session.req_header().headers.contains_key("x-cashu"))
+        {
+            return respond(session, 400, "Select exactly one payment method.\n", None).await;
+        }
+        if site.lightning.as_ref().is_some_and(|p| !p.protocols.x402)
+            && session
+                .req_header()
+                .headers
+                .contains_key("payment-signature")
+        {
+            return respond(session, 400, "Lightning x402 is disabled.\n", None).await;
+        }
         let lightning_header = if site.lightning.is_some() {
             let values = session.req_header().headers.get_all("payment-signature");
             if values.iter().count() > 1
@@ -164,7 +212,8 @@ impl ProxyHttp for Proxy {
             .payment
             .as_ref()
             .and_then(|_| payment_headers.iter().next());
-        if let Some(encoded) = lightning_header {
+        let using_l402 = l402_header.is_some();
+        if let Some(encoded) = l402_header.or(lightning_header) {
             if !self.tls && !client.is_some_and(|ip| ip.is_loopback()) {
                 return respond(session, 400, "Use HTTPS to send payments.\n", None).await;
             }
@@ -182,20 +231,33 @@ impl ProxyHttp for Proxy {
                 )
                 .await;
             };
-            match lightning.settle(policy, &hash, &encoded).await {
-                Ok(receipt) => ctx.lightning_receipt = Some(receipt),
+            let settlement = if using_l402 {
+                lightning
+                    .settle_l402(policy, &hash, &encoded)
+                    .await
+                    .map(|()| None)
+            } else {
+                lightning.settle(policy, &hash, &encoded).await.map(Some)
+            };
+            match settlement {
+                Ok(receipt) => ctx.lightning_receipt = receipt,
                 Err(error) => {
                     let status = match error {
-                        crate::payments::lightning::Error::Invalid => 400,
+                        crate::payments::lightning::Error::Invalid => {
+                            if using_l402 {
+                                401
+                            } else {
+                                400
+                            }
+                        }
                         _ => 503,
                     };
-                    return respond_with_headers(
-                        session,
-                        status,
-                        &format!("{error}\n"),
-                        &[("Cache-Control", "no-store")],
-                    )
-                    .await;
+                    let mut headers = vec![("Cache-Control", "no-store")];
+                    if status == 401 {
+                        headers.push(("WWW-Authenticate", "L402"));
+                    }
+                    return respond_with_headers(session, status, &format!("{error}\n"), &headers)
+                        .await;
                 }
             }
         } else if let Some(value) = supplied {
@@ -279,7 +341,12 @@ impl ProxyHttp for Proxy {
                         headers.push(("X-Cashu", cashu));
                     }
                     if let Some(required) = &required {
-                        headers.push(("PAYMENT-REQUIRED", required));
+                        if let Some(x402) = &required.x402 {
+                            headers.push(("PAYMENT-REQUIRED", x402));
+                        }
+                        if let Some(l402) = &required.l402 {
+                            headers.push(("WWW-Authenticate", l402));
+                        }
                     }
                     return respond_with_headers(
                         session,
@@ -297,6 +364,9 @@ impl ProxyHttp for Proxy {
                 )
                 .await;
             }
+        }
+        if l402_enabled {
+            session.req_header_mut().remove_header("authorization");
         }
         // Never forward bearer tokens, including on backend retries.
         if site.payment.is_some() || site.lightning.is_some() {
@@ -385,6 +455,14 @@ impl ProxyHttp for Proxy {
         {
             request.remove_header("X-Cashu");
             request.remove_header("payment-signature");
+        }
+        if ctx
+            .site
+            .as_ref()
+            .and_then(|site| site.lightning.as_ref())
+            .is_some_and(|p| p.protocols.l402)
+        {
+            request.remove_header("authorization");
         }
         // Direct internet clients cannot assert a trusted forwarding chain.
         for header in [
