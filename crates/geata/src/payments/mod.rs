@@ -1,4 +1,5 @@
 mod ledger;
+pub mod lightning;
 pub mod payout;
 
 use std::{

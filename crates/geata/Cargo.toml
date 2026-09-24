@@ -11,6 +11,12 @@ name = "geata"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
+bitcoin.workspace = true
+lightning-invoice.workspace = true
+prost.workspace = true
+http-body-util.workspace = true
+rustls-pemfile.workspace = true
 cdk.workspace = true
 cdk-sqlite.workspace = true
 redb.workspace = true
@@ -38,6 +44,8 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+h2.workspace = true
+tokio-rustls.workspace = true
 nostr-sdk.workspace = true
 tungstenite.workspace = true
 

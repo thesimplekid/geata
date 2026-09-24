@@ -36,6 +36,7 @@ pub struct Site {
     pub handler: Handler,
     pub rate_limit: Option<Arc<RateLimiter>>,
     pub payment: Option<PaymentPolicy>,
+    pub lightning: Option<crate::payments::lightning::Policy>,
     pub capacity: Option<Capacity>,
 }
 
@@ -129,14 +130,72 @@ impl Config {
             return Err(error(1, "configuration exceeds 1 MiB"));
         }
         let tokens = tokenize(input)?;
-        let mut sites = BTreeMap::new();
-        let mut payouts = Vec::new();
+        let mut receivers = BTreeMap::new();
+        let mut blocks = Vec::new();
         let mut cursor = 0;
+        // Resolve receivers before sites so definitions can appear in either order.
         while cursor < tokens.len() {
             let line = tokens[cursor].line;
             let address = tokens[cursor]
                 .text()
-                .ok_or_else(|| error(line, "expected a site address"))?;
+                .ok_or_else(|| error(line, "expected a site address or lightning block"))?;
+            cursor += 1;
+            let name = if address == "lightning" {
+                let name = tokens
+                    .get(cursor)
+                    .and_then(Token::text)
+                    .ok_or_else(|| error(line, "expected lightning <name> { ... }"))?;
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                {
+                    return Err(error(
+                        line,
+                        "Lightning receiver name must use letters, digits, '_' or '-'",
+                    ));
+                }
+                cursor += 1;
+                Some(name)
+            } else {
+                None
+            };
+            if !tokens
+                .get(cursor)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Open))
+            {
+                return Err(error(line, "expected '{' after block name"));
+            }
+            cursor += 1;
+            let start = cursor;
+            while tokens
+                .get(cursor)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Text(_)))
+            {
+                cursor += 1;
+            }
+            if !tokens
+                .get(cursor)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Close))
+            {
+                return Err(error(line, "expected '}' after block directives"));
+            }
+            let body = &tokens[start..cursor];
+            if let Some(name) = name {
+                let args: Vec<_> = body.iter().filter_map(Token::text).collect();
+                let receiver = crate::payments::lightning::ReceiverConfig::parse(&args)
+                    .map_err(|e| error(line, &e.to_string()))?;
+                if receivers.insert(name.to_owned(), receiver).is_some() {
+                    return Err(error(line, "duplicate Lightning receiver name"));
+                }
+            } else {
+                blocks.push((address, body, line));
+            }
+            cursor += 1;
+        }
+        let mut sites = BTreeMap::new();
+        let mut payouts = Vec::new();
+        for (address, body, line) in blocks {
             let https = !address.starts_with("http://");
             let domain = address
                 .strip_prefix("http://")
@@ -149,31 +208,8 @@ impl Config {
                     "expected a domain (e.g. example.com); use http://localhost for local HTTP. Wildcards, local HTTPS, and site ports are not supported yet",
                 ));
             }
-            if !tokens
-                .get(cursor + 1)
-                .is_some_and(|t| matches!(t.kind, TokenKind::Open))
-            {
-                return Err(error(line, "expected '{' after the site address"));
-            }
-            let start = cursor + 2;
-            cursor = start;
-            while tokens
-                .get(cursor)
-                .is_some_and(|t| matches!(t.kind, TokenKind::Text(_)))
-            {
-                cursor += 1;
-            }
-            if !tokens
-                .get(cursor)
-                .is_some_and(|t| matches!(t.kind, TokenKind::Close))
-            {
-                return Err(error(line, "expected '}' after site directives"));
-            }
             if address == "cashu_payout" {
-                let args: Vec<_> = tokens[start..cursor]
-                    .iter()
-                    .filter_map(Token::text)
-                    .collect();
+                let args: Vec<_> = body.iter().filter_map(Token::text).collect();
                 let payout = crate::payments::payout::PayoutPolicy::parse(&args)
                     .map_err(|e| error(line, &e.to_string()))?;
                 if payouts
@@ -186,27 +222,35 @@ impl Config {
                     return Err(error(line, "at most 16 payout mints are supported"));
                 }
                 payouts.push(payout);
-                cursor += 1;
                 continue;
             }
-            let (handler, rate_limit, payment, max_inflight) =
-                parse_directives(&tokens[start..cursor], line)?;
-            if payment.is_some() && rate_limit.is_none() {
-                return Err(error(line, "pay_over_limit requires rate_limit"));
+            let (handler, rate_limit, payment, lightning, max_inflight) =
+                parse_directives(body, line, &receivers, &domain, https)?;
+            if (payment.is_some() || lightning.is_some()) && rate_limit.is_none() {
+                return Err(error(
+                    line,
+                    "pay_over_limit and lightning_over_limit require rate_limit",
+                ));
             }
-            let max_inflight = max_inflight.or_else(|| payment.as_ref().map(|_| 128));
+            if let Some(policy) = &lightning {
+                policy
+                    .check_site(&domain, https)
+                    .map_err(|e| error(line, &e.to_string()))?;
+            }
+            let max_inflight =
+                max_inflight.or_else(|| (payment.is_some() || lightning.is_some()).then_some(128));
             let site = Site {
                 domain: domain.clone(),
                 https,
                 handler,
                 rate_limit: rate_limit.map(|limit| Arc::new(RateLimiter::new(limit))),
                 payment,
+                lightning,
                 capacity: max_inflight.map(Capacity::new),
             };
             if sites.insert(domain.clone(), site).is_some() {
                 return Err(error(line, &format!("duplicate site {domain}")));
             }
-            cursor += 1;
         }
         if sites.is_empty() {
             return Err(error(
@@ -225,12 +269,27 @@ impl Config {
     }
 }
 
-type ParsedDirectives = (Handler, Option<Limit>, Option<PaymentPolicy>, Option<u32>);
+type ParsedDirectives = (
+    Handler,
+    Option<Limit>,
+    Option<PaymentPolicy>,
+    Option<crate::payments::lightning::Policy>,
+    Option<u32>,
+);
 
-fn parse_directives(tokens: &[Token], line: usize) -> Result<ParsedDirectives, ConfigError> {
+fn parse_directives(
+    tokens: &[Token],
+    line: usize,
+    receivers: &BTreeMap<String, crate::payments::lightning::ReceiverConfig>,
+    domain: &str,
+    https: bool,
+) -> Result<ParsedDirectives, ConfigError> {
     let mut handler = None;
     let mut rate_limit = None;
     let mut payment = None;
+    let mut lightning = None;
+    let mut lightning_headers = None;
+    let mut lightning_origin = None;
     let mut max_inflight = None;
     let mut cursor = 0;
     while cursor < tokens.len() {
@@ -238,23 +297,19 @@ fn parse_directives(tokens: &[Token], line: usize) -> Result<ParsedDirectives, C
         let line = tokens[start].line;
         let count = match tokens[start].text() {
             Some("reverse_proxy") => 2,
-            Some("rate_limit" | "pay_over_limit") => 4,
-            Some("max_inflight") => 2,
+            Some("rate_limit" | "pay_over_limit" | "lightning_over_limit") => 4,
+            Some("max_inflight" | "lightning_origin") => 2,
+            Some("lightning_headers") => {
+                1 + tokens[start + 1..]
+                    .iter()
+                    .take_while(|token| token.quoted || !site_directive(token.text()))
+                    .count()
+            }
             Some("respond") => {
                 // The body is mandatory; a following directive cannot be its status.
-                let status = tokens.get(start + 2).is_some_and(|token| {
-                    token.quoted
-                        || !matches!(
-                            token.text(),
-                            Some(
-                                "rate_limit"
-                                    | "pay_over_limit"
-                                    | "max_inflight"
-                                    | "respond"
-                                    | "reverse_proxy"
-                            )
-                        )
-                });
+                let status = tokens
+                    .get(start + 2)
+                    .is_some_and(|token| token.quoted || !site_directive(token.text()));
                 2 + usize::from(status)
             }
             _ => 1,
@@ -266,6 +321,56 @@ fn parse_directives(tokens: &[Token], line: usize) -> Result<ParsedDirectives, C
             message: message.to_owned(),
         };
         match args[0].text() {
+            Some("lightning_over_limit") => {
+                if lightning.is_some() {
+                    return Err(error("duplicate lightning_over_limit directive"));
+                }
+                if args.len() != 4 {
+                    return Err(error(
+                        "expected lightning_over_limit <price> sat <receiver name>",
+                    ));
+                }
+                lightning = Some((
+                    args[1].text().unwrap_or_default(),
+                    args[2].text().unwrap_or_default(),
+                    args[3].text().unwrap_or_default(),
+                    line,
+                ));
+            }
+            Some("lightning_headers") => {
+                if lightning_headers.is_some() {
+                    return Err(error("duplicate lightning_headers directive"));
+                }
+                if args.len() < 2 {
+                    return Err(error(
+                        "expected lightning_headers <names...> or lightning_headers none",
+                    ));
+                }
+                if args.len() != 2 && args[1..].iter().any(|token| token.text() == Some("none")) {
+                    return Err(error(
+                        "lightning_headers none cannot be combined with header names",
+                    ));
+                }
+                let headers = if args.len() == 2 && args[1].text() == Some("none") {
+                    Vec::new()
+                } else {
+                    args[1..]
+                        .iter()
+                        .filter_map(Token::text)
+                        .map(str::to_owned)
+                        .collect()
+                };
+                lightning_headers = Some(headers);
+            }
+            Some("lightning_origin") => {
+                if lightning_origin.is_some() {
+                    return Err(error("duplicate lightning_origin directive"));
+                }
+                if args.len() != 2 {
+                    return Err(error("expected lightning_origin <public HTTP(S) origin>"));
+                }
+                lightning_origin = Some(args[1].text().unwrap_or_default().to_owned());
+            }
             Some("pay_over_limit") => {
                 if payment.is_some() {
                     return Err(error("duplicate pay_over_limit directive"));
@@ -336,7 +441,7 @@ fn parse_directives(tokens: &[Token], line: usize) -> Result<ParsedDirectives, C
             }
             _ => {
                 return Err(error(
-                    "unknown directive; expected reverse_proxy, respond, rate_limit, pay_over_limit, or max_inflight",
+                    "unknown directive; expected reverse_proxy, respond, rate_limit, pay_over_limit, lightning_over_limit, lightning_headers, lightning_origin, or max_inflight",
                 ));
             }
         }
@@ -345,7 +450,59 @@ fn parse_directives(tokens: &[Token], line: usize) -> Result<ParsedDirectives, C
         line,
         message: "expected exactly one reverse_proxy or respond directive per site".to_owned(),
     })?;
-    Ok((handler, rate_limit, payment, max_inflight))
+    let error = |message: &str| ConfigError {
+        line,
+        message: message.to_owned(),
+    };
+    let lightning = match lightning {
+        Some((price, unit, name, directive_line)) => {
+            let error = |message: &str| ConfigError {
+                line: directive_line,
+                message: message.to_owned(),
+            };
+            let receiver = receivers
+                .get(name)
+                .ok_or_else(|| error(&format!("unknown Lightning receiver: {name}")))?;
+            let headers = lightning_headers.ok_or_else(|| error("lightning_over_limit requires lightning_headers; use none only when no headers affect the request"))?;
+            let origin = lightning_origin
+                .unwrap_or_else(|| format!("{}://{domain}", if https { "https" } else { "http" }));
+            Some(
+                crate::payments::lightning::Policy::new(
+                    price,
+                    unit,
+                    receiver.clone(),
+                    origin,
+                    headers,
+                )
+                .map_err(|e| error(&e.to_string()))?,
+            )
+        }
+        None => {
+            if lightning_headers.is_some() || lightning_origin.is_some() {
+                return Err(error(
+                    "lightning_headers and lightning_origin require lightning_over_limit",
+                ));
+            }
+            None
+        }
+    };
+    Ok((handler, rate_limit, payment, lightning, max_inflight))
+}
+
+fn site_directive(value: Option<&str>) -> bool {
+    matches!(
+        value,
+        Some(
+            "reverse_proxy"
+                | "respond"
+                | "rate_limit"
+                | "pay_over_limit"
+                | "lightning_over_limit"
+                | "lightning_headers"
+                | "lightning_origin"
+                | "max_inflight"
+        )
+    )
 }
 
 struct Token {

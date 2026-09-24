@@ -37,6 +37,9 @@ demo-check binary="result/bin/geata":
 cashu:
     cargo test --locked --workspace --test cashu
 
+lightning:
+    cargo test --locked --workspace --test lightning
+
 rate-limits: build
     python3 tests/rate_limits.py "${CARGO_TARGET_DIR:-target}/debug/geata"
 

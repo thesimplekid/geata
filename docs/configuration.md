@@ -1,7 +1,8 @@
 # Configuration
 
 Each site has exactly one `reverse_proxy` or `respond` directive, with optional
-`rate_limit`, `pay_over_limit`, and `max_inflight` settings. Braces can
+`rate_limit`, `pay_over_limit`, `lightning_over_limit`, `lightning_headers`,
+`lightning_origin`, and `max_inflight` settings. Braces can
 appear on one line or multiple lines. Blank lines and `#` comments outside quoted
 strings are supported.
 
@@ -52,7 +53,7 @@ Backend addresses default to HTTP. HTTPS backends verify the certificate and
 hostname, and receive their own hostname in `Host`; the original host is sent in
 `X-Forwarded-Host`. Paths, query strings, streaming bodies, and WebSocket upgrades
 are forwarded. The client-facing HTTPS listener supports HTTP/1.1 and HTTP/2;
-backend connections currently use HTTP/1.1. There is no gRPC support in this version.
+backend connections currently use HTTP/1.1. Proxying gRPC is not supported; the Lightning receiver uses a separate gRPC client.
 
 The parser deliberately supports this small syntax, not the full Caddyfile
 language. Unsupported directives, duplicate sites, wildcard hosts, local HTTPS,
@@ -73,7 +74,12 @@ intermediate but syntactically valid version during a multi-step edit.
 An optional top-level `cashu_payout { ... }` block configures scheduled or
 balance-triggered [operator payouts](payouts.md), one block per mint.
 
+A top-level `lightning <name> { ... }` block defines a shared LDK Server receiver.
+Sites reference its name with `lightning_over_limit` and select their own bound
+headers with `lightning_headers`. See [Lightning payments](lightning.md) for the
+complete syntax and credential paths.
+
 For request controls, see [rate limiting](rate-limiting.md) and
-[Cashu payments](cashu.md).
+[Cashu payments](cashu.md), and [Lightning payments](lightning.md).
 
 Back to [Geata](../README.md).

@@ -4,6 +4,8 @@ For a live dashboard with traffic controls, request rates, pricing, and manual
 Cashu payments, see the [traffic demo](../examples/traffic-demo/README.md).
 Run `nix build path:.` then `nix develop path:. -c just demo`.
 
+To also offer Lightning invoices from LDK Server, see [Lightning payments](lightning.md).
+
 ## Configuration
 
 Offer a fixed price for requests beyond the free allowance:

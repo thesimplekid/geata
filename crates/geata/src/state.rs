@@ -8,6 +8,7 @@ use crate::{certificates::Certificate, config::Config, payments::Payments};
 pub struct State {
     pub config: ArcSwap<Config>,
     pub payments: Option<Arc<Payments>>,
+    pub lightning: Option<Arc<crate::payments::lightning::Lightning>>,
     pub certificates: RwLock<HashMap<String, Arc<Certificate>>>,
     pub challenges: RwLock<HashMap<(String, String), String>>,
 }
@@ -17,6 +18,7 @@ impl State {
         Self {
             config: ArcSwap::from_pointee(config),
             payments: None,
+            lightning: None,
             certificates: RwLock::new(HashMap::new()),
             challenges: RwLock::new(HashMap::new()),
         }

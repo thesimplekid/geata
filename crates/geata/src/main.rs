@@ -216,6 +216,7 @@ fn main() -> anyhow::Result<()> {
             let storage = Arc::new(Storage::open(&data_dir, &directory_url)?);
             let mut state = State::new(parsed);
             state.payments = Some(Arc::new(payments::Payments::new(&data_dir)));
+            state.lightning = Some(Arc::new(payments::lightning::Lightning::new(&data_dir)));
             let state = Arc::new(state);
             // Populate before accepting connections, so restart reuses certificates immediately.
             for domain in state.config.load().https_domains() {

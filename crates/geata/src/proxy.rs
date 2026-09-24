@@ -32,6 +32,7 @@ pub struct RequestContext {
     addresses: Vec<SocketAddr>,
     address_index: usize,
     _capacity: Option<CapacityPermit>,
+    lightning_receipt: Option<String>,
 }
 
 #[async_trait]
@@ -46,6 +47,7 @@ impl ProxyHttp for Proxy {
             addresses: Vec::new(),
             address_index: 0,
             _capacity: None,
+            lightning_receipt: None,
         }
     }
 
@@ -134,12 +136,69 @@ impl ProxyHttp for Proxy {
                 }
             }
         }
+        let lightning_header = if site.lightning.is_some() {
+            let values = session.req_header().headers.get_all("payment-signature");
+            if values.iter().count() > 1
+                || (values.iter().next().is_some()
+                    && session.req_header().headers.contains_key("x-cashu"))
+            {
+                return respond(session, 400, "Select exactly one payment method.\n", None).await;
+            }
+            match values.iter().next() {
+                Some(value) => match value.to_str() {
+                    Ok(value) if value.len() <= crate::payments::lightning::MAX_PAYMENT_HEADER => {
+                        Some(value.to_owned())
+                    }
+                    _ => {
+                        return respond(session, 400, "Invalid Lightning payment header.\n", None)
+                            .await;
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
         let payment_headers = session.req_header().headers.get_all("X-Cashu");
         let supplied = site
             .payment
             .as_ref()
             .and_then(|_| payment_headers.iter().next());
-        if let Some(value) = supplied {
+        if let Some(encoded) = lightning_header {
+            if !self.tls && !client.is_some_and(|ip| ip.is_loopback()) {
+                return respond(session, 400, "Use HTTPS to send payments.\n", None).await;
+            }
+            let policy = site.lightning.as_ref().expect("Lightning policy checked");
+            let Some(lightning) = &self.state.lightning else {
+                return respond(session, 503, "Lightning unavailable.\n", None).await;
+            };
+            let binding = lightning_binding(session, policy, self.tls).await;
+            let Ok((_, hash)) = binding else {
+                return respond(
+                    session,
+                    400,
+                    "Unsupported Lightning request binding or body size.\n",
+                    None,
+                )
+                .await;
+            };
+            match lightning.settle(policy, &hash, &encoded).await {
+                Ok(receipt) => ctx.lightning_receipt = Some(receipt),
+                Err(error) => {
+                    let status = match error {
+                        crate::payments::lightning::Error::Invalid => 400,
+                        _ => 503,
+                    };
+                    return respond_with_headers(
+                        session,
+                        status,
+                        &format!("{error}\n"),
+                        &[("Cache-Control", "no-store")],
+                    )
+                    .await;
+                }
+            }
+        } else if let Some(value) = supplied {
             if payment_headers.iter().count() != 1 {
                 return respond(session, 400, "Provide exactly one X-Cashu token.\n", None).await;
             }
@@ -194,17 +253,39 @@ impl ProxyHttp for Proxy {
             if let Err(wait) = limiter.check(client) {
                 let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() != 0);
                 let retry_after = seconds.max(1).to_string();
-                if let Some(payment) = &site.payment {
-                    let challenge = payment.challenge();
+                if site.payment.is_some() || site.lightning.is_some() {
+                    let cashu = site.payment.as_ref().map(|p| p.challenge());
+                    let mut required = None;
+                    if let (Some(policy), Some(lightning)) =
+                        (&site.lightning, &self.state.lightning)
+                        && let Ok((url, hash)) = lightning_binding(session, policy, self.tls).await
+                    {
+                        required = lightning.challenge(policy, &url, &hash, client).await.ok();
+                    }
+                    if cashu.is_none() && required.is_none() {
+                        return respond_with_headers(
+                            session,
+                            503,
+                            "Lightning challenge unavailable.\n",
+                            &[("Retry-After", "1"), ("Cache-Control", "no-store")],
+                        )
+                        .await;
+                    }
+                    let mut headers = vec![
+                        ("Retry-After", retry_after.as_str()),
+                        ("Cache-Control", "no-store"),
+                    ];
+                    if let Some(cashu) = &cashu {
+                        headers.push(("X-Cashu", cashu));
+                    }
+                    if let Some(required) = &required {
+                        headers.push(("PAYMENT-REQUIRED", required));
+                    }
                     return respond_with_headers(
                         session,
                         402,
                         "Payment required, or wait for the free allowance.\n",
-                        &[
-                            ("X-Cashu", &challenge),
-                            ("Retry-After", &retry_after),
-                            ("Cache-Control", "no-store"),
-                        ],
+                        &headers,
                     )
                     .await;
                 }
@@ -218,16 +299,19 @@ impl ProxyHttp for Proxy {
             }
         }
         // Never forward bearer tokens, including on backend retries.
-        if site.payment.is_some() {
+        if site.payment.is_some() || site.lightning.is_some() {
             session.req_header_mut().remove_header("X-Cashu");
+            session.req_header_mut().remove_header("payment-signature");
         }
         if let Handler::Respond { body, status } = &site.handler {
-            let headers = if site.payment.is_some() {
-                &[("Cache-Control", "no-store")][..]
-            } else {
-                &[]
-            };
-            return respond_with_headers(session, *status, body, headers).await;
+            let mut headers = Vec::new();
+            if site.payment.is_some() || site.lightning.is_some() {
+                headers.push(("Cache-Control", "no-store"));
+            }
+            if let Some(receipt) = &ctx.lightning_receipt {
+                headers.push(("PAYMENT-RESPONSE", receipt.as_str()));
+            }
+            return respond_with_headers(session, *status, body, &headers).await;
         }
         ctx.site = Some(site);
         Ok(false)
@@ -294,8 +378,13 @@ impl ProxyHttp for Proxy {
         request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        if ctx.site.as_ref().is_some_and(|site| site.payment.is_some()) {
+        if ctx
+            .site
+            .as_ref()
+            .is_some_and(|site| site.payment.is_some() || site.lightning.is_some())
+        {
             request.remove_header("X-Cashu");
+            request.remove_header("payment-signature");
         }
         // Direct internet clients cannot assert a trusted forwarding chain.
         for header in [
@@ -337,8 +426,16 @@ impl ProxyHttp for Proxy {
         response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        if ctx.site.as_ref().is_some_and(|site| site.payment.is_some()) {
+        if ctx
+            .site
+            .as_ref()
+            .is_some_and(|site| site.payment.is_some() || site.lightning.is_some())
+        {
             response.insert_header("Cache-Control", "no-store")?;
+            response.remove_header("payment-response");
+            if let Some(receipt) = &ctx.lightning_receipt {
+                response.insert_header("PAYMENT-RESPONSE", receipt)?;
+            }
         }
         Ok(())
     }
@@ -389,4 +486,67 @@ async fn respond_with_headers(
             .await?;
     }
     Ok(true)
+}
+
+// Buffer before settlement, so a body-changing retry cannot reuse an earlier proof.
+// Pingora forwards its retry buffer to either HTTP/1 or HTTP/2 upstreams.
+async fn lightning_binding(
+    session: &mut Session,
+    policy: &crate::payments::lightning::Policy,
+    tls: bool,
+) -> anyhow::Result<(String, String)> {
+    use anyhow::ensure;
+    let header = session.req_header();
+    ensure!(
+        !header.headers.contains_key("trailer") && !header.headers.contains_key("upgrade"),
+        "trailers and upgrades are unsupported for Lightning"
+    );
+    let authority = header
+        .headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| header.uri.authority().map(|a| a.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("missing host"))?;
+    let origin = format!("{}://{authority}", if tls { "https" } else { "http" });
+    ensure!(origin == policy.origin, "public origin mismatch");
+    if let Some(scheme) = header.uri.scheme_str() {
+        ensure!(
+            scheme == if tls { "https" } else { "http" },
+            "request scheme mismatch"
+        );
+    }
+    if let Some(uri_authority) = header.uri.authority() {
+        ensure!(
+            uri_authority.as_str() == authority,
+            "request authority mismatch"
+        );
+    }
+    let path = header.uri.path_and_query().map_or("/", |p| p.as_str());
+    ensure!(path.starts_with('/'), "unsupported request target");
+    let url = format!("{origin}{path}");
+    session.as_mut().enable_retry_buffering();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut body = Vec::new();
+        while let Some(chunk) = session.read_request_body().await? {
+            ensure!(
+                body.len() + chunk.len() <= crate::payments::lightning::MAX_BODY,
+                "Lightning body exceeds 64 KiB"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        ensure!(
+            !session.as_ref().retry_buffer_truncated(),
+            "request body could not be buffered"
+        );
+        let header = session.req_header();
+        let hash = crate::payments::lightning::request_hash(
+            policy,
+            header.method.as_str(),
+            &url,
+            &header.headers,
+            &body,
+        )?;
+        Ok((url, hash))
+    })
+    .await?
 }

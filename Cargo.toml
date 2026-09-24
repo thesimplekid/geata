@@ -9,6 +9,14 @@ rust-version = "1.95"
 license = "MIT"
 
 [workspace.dependencies]
+base64 = "0.22"
+bitcoin = "0.32"
+lightning-invoice = "0.34.1"
+prost = "0.14"
+http-body-util = "0.1"
+h2 = "0.4"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
 anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"

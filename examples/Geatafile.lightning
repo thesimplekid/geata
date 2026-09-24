@@ -1,0 +1,17 @@
+# Replace domain, mint, node public key, and credential paths for your deployment.
+# See docs/lightning.md for receiver and request-binding requirements.
+lightning my_node {
+    endpoint https://localhost:3536
+    api_key_file /var/lib/ldk-server/bitcoin/api_key
+    tls_cert_file /var/lib/ldk-server/tls.crt
+    network mainnet
+    pay_to YOUR_66_CHARACTER_COMPRESSED_NODE_PUBLIC_KEY
+}
+
+example.com {
+    rate_limit 10/s burst 20
+    pay_over_limit 2 sat https://mint.example.com
+    lightning_over_limit 2 sat my_node
+    lightning_headers accept authorization content-encoding content-type cookie range
+    reverse_proxy localhost:3000
+}

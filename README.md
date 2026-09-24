@@ -4,7 +4,7 @@
 > [github.com/thesimplekid/geata](https://github.com/thesimplekid/geata) is a mirror.
 
 Geata (Irish for “gate”) is a Rust reverse proxy that lets clients **pay for
-requests beyond a free rate limit using Cashu**. It combines Caddy-style
+requests beyond a free rate limit using Cashu or Lightning**. It combines Caddy-style
 configuration and automatic HTTPS with payment handling at the proxy.
 
 Each client IP gets a free request allowance. When it runs out, Geata returns
@@ -25,6 +25,9 @@ Here, each IP gets a bucket of 20 free requests that refills at 10 per second.
 A paid request costs a fixed **2 sats plus mint fees**; the price does not rise
 with traffic. Payment buys one request attempt. See [Cashu payments](docs/cashu.md)
 for token requirements, excess payments, and recovery.
+
+For Lightning x402 alongside Cashu, connect a separate LDK Server with
+`lightning_over_limit`; see [Lightning payments](docs/lightning.md).
 
 Built on Pingora, Geata can also serve plain-text responses directly.
 
@@ -73,6 +76,7 @@ choose a test or real mint and set the price.
 - [Build and run](docs/getting-started.md)
 - [Configuration](docs/configuration.md) — proxying, direct responses, reloads
 - [Rate limiting](docs/rate-limiting.md) — per-IP allowances and burst limits
+- [Lightning payments](docs/lightning.md) — x402 with LDK Server, request binding, replay protection
 - [Cashu payments](docs/cashu.md) — pricing, tokens, wallets, recovery
 - [HTTPS and operation](docs/operations.md) — certificates, storage, deployment limits
 - [Development](DEVELOPMENT.md) — contributor workflow and tests
