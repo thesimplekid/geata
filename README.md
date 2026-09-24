@@ -4,14 +4,14 @@
 > [github.com/thesimplekid/geata](https://github.com/thesimplekid/geata) is a mirror.
 
 Geata (Irish for “gate”) is a Rust reverse proxy that lets clients **pay for
-requests beyond a free rate limit using Cashu or Lightning**. It combines Caddy-style
+requests beyond a free rate limit using Cashu or Lightning (L402 and x402)**. It combines Caddy-style
 configuration and automatic HTTPS with payment handling at the proxy.
 
 Each client IP gets a free request allowance. When it runs out, Geata returns
-**402 Payment Required** with the price and accepted Cashu mint. The client can
-wait for the allowance to refill, or retry with a Cashu token. Geata verifies
-and redeems the token before forwarding the request, so your backend does not
-need payment logic.
+**402 Payment Required** with the price and configured payment options. The client
+can wait for the allowance to refill, or pay with a Cashu token or a Lightning
+invoice and retry with the payment proof. Geata verifies and settles the payment
+before forwarding the request, so your backend does not need payment logic.
 
 ```caddyfile
 example.com {
@@ -26,13 +26,30 @@ A paid request costs a fixed **2 sats plus mint fees**; the price does not rise
 with traffic. Payment buys one request attempt. See [Cashu payments](docs/cashu.md)
 for token requirements, excess payments, and recovery.
 
-For Lightning x402 or L402 alongside Cashu, connect a separate LDK Server with
-`lightning_over_limit`. L402 can also receive through a Cashu mint without your own
-node; see [Lightning payments](docs/lightning.md).
-
 Built on Pingora, Geata can also serve plain-text responses directly.
 
 An early implementation for a single Linux server; see [current scope](docs/operations.md#current-scope).
+
+## Payment options
+
+Cashu and Lightning can be offered together or on their own:
+
+| Payment method | Receiver | Where proceeds go |
+| --- | --- | --- |
+| Cashu tokens | Cashu mint | Geata's Cashu wallet |
+| Lightning L402 | LDK Server or Cashu mint | Your Lightning node or Geata's Cashu wallet |
+| Lightning x402 | LDK Server | Your Lightning node |
+
+For Lightning, define a named receiver and reference it with
+`lightning_over_limit`. Select `lightning_protocols x402 l402` to offer both
+protocols through LDK Server; the default is `x402`. To accept Lightning without
+running your own node, use a Cashu mint receiver with `lightning_protocols l402`.
+
+Lightning payments are bound to the request and buy one request attempt.
+Enabling L402 reserves the `Authorization` header for payment credentials,
+including on free requests. See [Lightning payments](docs/lightning.md) for
+complete configurations, client payment flows, and backend authentication options.
+To try either protocol against a URL, run the [Rust client example](examples/README.md).
 
 ## Try it locally
 
