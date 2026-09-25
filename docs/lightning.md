@@ -28,8 +28,8 @@ lightning my_node {
 
 example.com {
     rate_limit 10/s burst 20
-    pay_over_limit 2 sat https://mint.example.com
-    lightning_over_limit 2 sat my_node
+    pay 2 sat https://mint.example.com
+    lightning_pay 2 sat my_node
     lightning_headers accept authorization content-encoding content-type cookie range
     reverse_proxy localhost:3000
 }
@@ -47,10 +47,11 @@ share one named receiver while keeping separate prices, origins, and bound heade
 Duplicate names, duplicate or unknown receiver settings, missing required settings,
 and references to undefined receivers are rejected by `geata validate`.
 
-`lightning_over_limit <price> sat <receiver name>` requires `rate_limit` and
-`lightning_headers`. Prices are positive whole sats, converted exactly to
+`lightning_pay <price> sat <receiver name>` requires `lightning_headers`.
+Omit `rate_limit` to require payment for every request, or add it to grant a free
+allowance before payment is required. Prices are positive whole sats, converted exactly to
 millisatoshis on the wire. Cashu and Lightning prices may differ. Omit
-`pay_over_limit` for Lightning only. The default `max_inflight` is 128 when either
+`pay` for Lightning only. The default `max_inflight` is 128 when either
 payment method is enabled.
 
 `lightning_headers <names...>` explicitly selects the site's bound headers in
@@ -64,7 +65,7 @@ The public origin defaults to the site's scheme and domain, such as
 ```caddyfile
 http://localhost {
     rate_limit 1/s burst 1
-    lightning_over_limit 2 sat my_node
+    lightning_pay 2 sat my_node
     lightning_headers none
     lightning_origin http://localhost:8080
     respond "Hello world!"
@@ -101,8 +102,8 @@ lightning my_mint {
 
 example.com {
     rate_limit 10/s burst 20
-    pay_over_limit 2 sat https://mint.example.com
-    lightning_over_limit 2 sat my_mint
+    pay 2 sat https://mint.example.com
+    lightning_pay 2 sat my_mint
     lightning_protocols l402
     lightning_headers accept content-encoding content-type cookie range
     reverse_proxy localhost:3000
@@ -158,8 +159,8 @@ To offer all three payment methods, use this site with the receiver above:
 ```caddyfile
 example.com {
     rate_limit 10/s burst 20
-    pay_over_limit 2 sat https://mint.example.com
-    lightning_over_limit 2 sat my_node
+    pay 2 sat https://mint.example.com
+    lightning_pay 2 sat my_node
     lightning_protocols x402 l402
     lightning_headers accept content-encoding content-type cookie range
     reverse_proxy localhost:3000
@@ -203,7 +204,7 @@ The gRPC L402 profile is not supported.
 
 ## Payment flow
 
-With x402 enabled, after the free allowance runs out, a 402 response includes `PAYMENT-REQUIRED`
+With x402 enabled, when there is no free allowance or it runs out, a 402 response includes `PAYMENT-REQUIRED`
 containing a base64-encoded x402 v2 challenge. Sites with Cashu also include
 `X-Cashu`. A client selects one method per request; providing both payment headers
 is rejected before either payment is processed.

@@ -42,7 +42,7 @@ fn missing_challenge(headers: &http::HeaderMap, expected: &str) -> String {
     format!(
         "402 response is missing {expected}. Payment-related headers present: {advertised}. \
          The client --protocol flag does not enable server support. Check the site's \
-         lightning_over_limit and lightning_protocols settings. Geata can return a \
+         lightning_pay and lightning_protocols settings. Geata can return a \
          Cashu-only challenge when Lightning invoice creation or request binding is unavailable."
     )
 }

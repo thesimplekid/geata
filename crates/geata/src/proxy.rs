@@ -308,13 +308,19 @@ impl ProxyHttp for Proxy {
                     .await;
                 }
             }
-        } else if let Some(limiter) = &site.rate_limit {
+        } else if site.rate_limit.is_some() || site.payment.is_some() || site.lightning.is_some() {
             let client = client.ok_or_else(|| {
                 Error::explain(ErrorType::InternalError, "request has no client IP")
             })?;
-            if let Err(wait) = limiter.check(client) {
-                let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() != 0);
-                let retry_after = seconds.max(1).to_string();
+            let wait = site
+                .rate_limit
+                .as_ref()
+                .and_then(|limiter| limiter.check(client).err());
+            if wait.is_some() || site.rate_limit.is_none() {
+                let retry_after = wait.map(|wait| {
+                    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() != 0);
+                    seconds.max(1).to_string()
+                });
                 if site.payment.is_some() || site.lightning.is_some() {
                     let cashu = site.payment.as_ref().map(|p| p.challenge());
                     let mut required = None;
@@ -333,10 +339,10 @@ impl ProxyHttp for Proxy {
                         )
                         .await;
                     }
-                    let mut headers = vec![
-                        ("Retry-After", retry_after.as_str()),
-                        ("Cache-Control", "no-store"),
-                    ];
+                    let mut headers = vec![("Cache-Control", "no-store")];
+                    if let Some(retry_after) = &retry_after {
+                        headers.push(("Retry-After", retry_after.as_str()));
+                    }
                     if let Some(cashu) = &cashu {
                         headers.push(("X-Cashu", cashu));
                     }
@@ -351,7 +357,11 @@ impl ProxyHttp for Proxy {
                     return respond_with_headers(
                         session,
                         402,
-                        "Payment required, or wait for the free allowance.\n",
+                        if retry_after.is_some() {
+                            "Payment required, or wait for the free allowance.\n"
+                        } else {
+                            "Payment required.\n"
+                        },
                         &headers,
                     )
                     .await;
@@ -360,7 +370,10 @@ impl ProxyHttp for Proxy {
                     session,
                     429,
                     "Too many requests.\n",
-                    &[("Retry-After", &retry_after), ("Cache-Control", "no-store")],
+                    &[
+                        ("Retry-After", retry_after.as_deref().unwrap_or("1")),
+                        ("Cache-Control", "no-store"),
+                    ],
                 )
                 .await;
             }

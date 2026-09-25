@@ -860,8 +860,8 @@ mod tests {
     fn named_receivers_are_shared_with_site_specific_bindings_and_forward_references()
     -> anyhow::Result<()> {
         let config = crate::config::Config::parse(&format!(
-            "api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_over_limit 25 sat node lightning_headers authorization content-type pay_over_limit 2 sat https://mint.example.com }}
-             http://localhost {{ lightning_headers none lightning_origin http://localhost:8080 lightning_over_limit 2 sat node rate_limit 1/s burst 1 respond ok }}
+            "api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_pay 25 sat node lightning_headers authorization content-type pay 2 sat https://mint.example.com }}
+             http://localhost {{ lightning_headers none lightning_origin http://localhost:8080 lightning_pay 2 sat node rate_limit 1/s burst 1 respond ok }}
              {}", receiver_block()
         ))?;
         let site = &config.sites["api.example.com"];
@@ -883,7 +883,7 @@ mod tests {
         assert_eq!(second.amount_msat, 2000);
         assert_eq!(first.receiver.ldk().expect("LDK").expiry_seconds, 300);
         let testnet = crate::config::Config::parse(&format!(
-            "{} api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_over_limit 1 sat node lightning_headers none }}",
+            "{} api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_pay 1 sat node lightning_headers none }}",
             receiver_block().replace("network mainnet", "network testnet expiry_seconds 600")
         ))?;
         let policy = testnet.sites["api.example.com"]
@@ -904,7 +904,7 @@ mod tests {
             ("lightning_protocols x402 l402", true, true),
         ] {
             let config = crate::config::Config::parse(&format!(
-                "{} api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_over_limit 25 sat node lightning_headers cookie {directive} }}",
+                "{} api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_pay 25 sat node lightning_headers cookie {directive} }}",
                 receiver_block()
             ))?;
             let protocols = &config.sites["api.example.com"]
@@ -920,7 +920,7 @@ mod tests {
     #[test]
     fn cashu_receivers_require_l402_and_reject_mixed_backend_settings() -> anyhow::Result<()> {
         let block = "lightning mint { mint https://mint.example.com network mainnet }";
-        let site = "api.example.com { respond ok rate_limit 1/s burst 1 lightning_over_limit 8 sat mint lightning_headers cookie lightning_protocols l402 }";
+        let site = "api.example.com { respond ok rate_limit 1/s burst 1 lightning_pay 8 sat mint lightning_headers cookie lightning_protocols l402 }";
         let config = crate::config::Config::parse(&format!("{site} {block}"))?;
         let policy = config.sites["api.example.com"]
             .lightning
@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn invalid_receiver_definitions_and_site_bindings_are_rejected() {
         let block = receiver_block();
-        let site = "api.example.com { respond ok rate_limit 1/s burst 1 lightning_over_limit 25 sat node lightning_headers none }";
+        let site = "api.example.com { respond ok rate_limit 1/s burst 1 lightning_pay 25 sat node lightning_headers none }";
         for invalid in [
             block.replace("network mainnet", "network regtest"),
             block.replace("network mainnet", "network mainnet network testnet"),
@@ -980,25 +980,25 @@ mod tests {
             );
         }
         for invalid in [
-            "lightning_over_limit 25 sat missing lightning_headers none",
-            "lightning_over_limit 25 sat node",
+            "lightning_pay 25 sat missing lightning_headers none",
+            "lightning_pay 25 sat node",
             "lightning_headers none",
             "lightning_protocols l402",
-            "lightning_over_limit 25 sat node lightning_headers none lightning_protocols",
-            "lightning_over_limit 25 sat node lightning_headers none lightning_protocols other",
-            "lightning_over_limit 25 sat node lightning_headers none lightning_protocols x402 x402",
-            "lightning_over_limit 25 sat node lightning_headers none lightning_protocols l402 lightning_protocols x402",
-            "lightning_over_limit 25 sat node lightning_headers authorization lightning_protocols l402",
+            "lightning_pay 25 sat node lightning_headers none lightning_protocols",
+            "lightning_pay 25 sat node lightning_headers none lightning_protocols other",
+            "lightning_pay 25 sat node lightning_headers none lightning_protocols x402 x402",
+            "lightning_pay 25 sat node lightning_headers none lightning_protocols l402 lightning_protocols x402",
+            "lightning_pay 25 sat node lightning_headers authorization lightning_protocols l402",
             "lightning_origin https://api.example.com",
-            "lightning_over_limit 0 sat node lightning_headers none",
-            "lightning_over_limit 25 msat node lightning_headers none",
-            "lightning_over_limit 18446744073709551615 sat node lightning_headers none",
-            "lightning_over_limit 25 sat node lightning_headers cookie authorization",
-            "lightning_over_limit 25 sat node lightning_headers authorization authorization",
-            "lightning_over_limit 25 sat node lightning_headers payment-signature",
-            "lightning_over_limit 25 sat node lightning_headers authorization none",
-            "lightning_over_limit 25 sat node lightning_headers none lightning_headers none",
-            "lightning_over_limit 25 sat node lightning_headers none lightning_origin https://other.example.com",
+            "lightning_pay 0 sat node lightning_headers none",
+            "lightning_pay 25 msat node lightning_headers none",
+            "lightning_pay 18446744073709551615 sat node lightning_headers none",
+            "lightning_pay 25 sat node lightning_headers cookie authorization",
+            "lightning_pay 25 sat node lightning_headers authorization authorization",
+            "lightning_pay 25 sat node lightning_headers payment-signature",
+            "lightning_pay 25 sat node lightning_headers authorization none",
+            "lightning_pay 25 sat node lightning_headers none lightning_headers none",
+            "lightning_pay 25 sat node lightning_headers none lightning_origin https://other.example.com",
         ] {
             assert!(
                 crate::config::Config::parse(&format!(
@@ -1008,13 +1008,14 @@ mod tests {
                 "{invalid}"
             );
         }
-        assert!(crate::config::Config::parse(&format!("{block} api.example.com {{ respond ok lightning_over_limit 25 sat node lightning_headers none }}")).is_err());
+        assert!(crate::config::Config::parse(&format!("{block} api.example.com {{ respond ok lightning_pay 25 sat node lightning_headers none }}")).is_ok());
+        assert!(crate::config::Config::parse(&format!("{block} api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_over_limit 25 sat node lightning_headers none }}")).is_err());
     }
 
     #[test]
     fn reload_updates_receiver_and_site_settings_together() -> anyhow::Result<()> {
         let text = format!(
-            "{} api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_over_limit 25 sat node lightning_headers none }}",
+            "{} api.example.com {{ respond ok rate_limit 1/s burst 1 lightning_pay 25 sat node lightning_headers none }}",
             receiver_block()
         );
         let state = crate::state::State::new(crate::config::Config::parse(&text)?);

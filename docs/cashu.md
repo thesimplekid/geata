@@ -13,23 +13,24 @@ Offer a fixed price for requests beyond the free allowance:
 ```caddyfile
 example.com {
     rate_limit 10/s burst 20
-    pay_over_limit 2 sat https://mint.example.com
+    pay 2 sat https://mint.example.com
     max_inflight 128
     reverse_proxy localhost:3000
 }
 ```
 
-Replace the mint URL with a Cashu mint you trust. `pay_over_limit` requires
-`rate_limit` and works with either `reverse_proxy` or `respond`. The price is a
-positive integer in sats; it does not change with traffic. Without this setting,
+Replace the mint URL with a Cashu mint you trust. `pay` works with either
+`reverse_proxy` or `respond`. Omit `rate_limit` to require payment for every request.
+The price is a positive integer in sats; it does not change with traffic. Without this setting,
 exhausting the allowance continues to return 429.
 
 ## Payment flow
 
-When the free allowance is exhausted, Geata responds with **402 Payment Required**.
+When no free allowance is configured, or it is exhausted, Geata responds with **402 Payment Required**.
 Its `X-Cashu` header contains a standard [NUT-24](https://cashubtc.github.io/nuts/24/)
 payment request with the price and accepted mint. `Retry-After` gives the wait
-for the free allowance to refill, so paying is optional. A Cashu-aware client
+for the free allowance to refill when one is configured; otherwise this header is
+omitted and payment is required. A Cashu-aware client
 can retry with a `cashuB` token in `X-Cashu`:
 
 ```sh

@@ -37,8 +37,8 @@ The amount and network are displayed for review before you pay.
 
 If a 402 response lacks the selected protocol's challenge header, check the
 deployed server configuration. `--protocol` selects a client flow; it does not
-enable that protocol on the server. `pay_over_limit` alone enables Cashu tokens.
-Lightning needs a receiver and `lightning_over_limit`; L402 also needs an explicit
+enable that protocol on the server. `pay` alone enables Cashu tokens.
+Lightning needs a receiver and `lightning_pay`; L402 also needs an explicit
 `lightning_protocols l402` or `lightning_protocols x402 l402`. Mint receivers only
 support L402. When Cashu is also configured, Geata can return only `X-Cashu` if
 Lightning invoice creation or request binding fails, including invoice issuance

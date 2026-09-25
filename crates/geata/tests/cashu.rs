@@ -484,34 +484,43 @@ fn settled_request(
 
 #[test]
 fn cashu_v1_redeems_once_and_recovers_without_double_charging() -> anyhow::Result<()> {
-    cashu_overflow(false)
+    cashu_overflow(false, false)
 }
 
 #[test]
 fn cashu_v2_redeems_once_and_recovers_without_double_charging() -> anyhow::Result<()> {
-    cashu_overflow(true)
+    cashu_overflow(true, false)
 }
 
-fn cashu_overflow(v2: bool) -> anyhow::Result<()> {
+#[test]
+fn cashu_requires_payment_without_a_free_allowance() -> anyhow::Result<()> {
+    cashu_overflow(true, true)
+}
+
+fn cashu_overflow(v2: bool, always_paid: bool) -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let mint = Arc::new(Mint::new(v2));
     let server = Server::start(mint.clone())?;
     let mint_url = format!("http://127.0.0.1:{}", server.port);
     let (hp, tp) = (port()?, port()?);
+    let allowance = if always_paid {
+        ""
+    } else {
+        "rate_limit 1/s burst 1"
+    };
     std::fs::write(
         root.path().join("Geatafile"),
         format!(
             r#"
 http://ready.local {{ respond "ready" }}
 http://localhost {{
-    rate_limit 1/s burst 1
-    pay_over_limit 2 sat {mint_url}
+    {allowance}
+    pay 2 sat {mint_url}
     max_inflight 1
     reverse_proxy 127.0.0.1:{}
 }}
 http://direct.local {{
-    rate_limit 1/s burst 1
-    pay_over_limit 2 sat {mint_url}
+    pay 2 sat {mint_url}
     respond "paid directly"
 }}
 "#,
@@ -520,9 +529,19 @@ http://direct.local {{
     )?;
     let mut proxy = Some(start(root.path(), hp, tp)?);
     let test = (|| -> anyhow::Result<()> {
-        assert_eq!(settled_request(hp, "localhost", "/backend", None)?.0, 200);
+        for _ in 0..2 {
+            let (status, headers, body) = settled_request(hp, "direct.local", "/", None)?;
+            assert_eq!(status, 402);
+            assert!(headers.contains_key("x-cashu"));
+            assert!(!headers.contains_key("retry-after"));
+            assert_eq!(body, "Payment required.\n");
+        }
+        if !always_paid {
+            assert_eq!(settled_request(hp, "localhost", "/backend", None)?.0, 200);
+        }
         let (status, headers, _) = settled_request(hp, "localhost", "/backend", None)?;
         assert_eq!(status, 402);
+        assert_eq!(headers.contains_key("retry-after"), !always_paid);
         let payment = PaymentRequest::from_str(&headers["x-cashu"])?;
         assert_eq!(payment.amount, Some(Amount::from(2)));
         assert_eq!(headers["cache-control"], "no-store");
@@ -548,6 +567,9 @@ http://direct.local {{
         assert_eq!(paid.1["cache-control"], "no-store");
         assert_eq!(mint.swaps.load(Ordering::SeqCst), 1);
         assert!(!mint.leaked_token.load(Ordering::SeqCst));
+        if always_paid {
+            assert_eq!(settled_request(hp, "localhost", "/backend", None)?.0, 402);
+        }
         assert_eq!(
             settled_request(hp, "localhost", "/backend", Some(&token))?.0,
             400
@@ -720,7 +742,7 @@ fn payouts_deliver_enforce_fees_and_pause_uncertain_sends() -> anyhow::Result<()
         .build()
         .to_string();
     let base = format!(
-        "http://ready.local {{ respond ready }}\nhttp://localhost {{ respond paid rate_limit 1/s burst 1 pay_over_limit 2 sat {mint_url} }}\n"
+        "http://ready.local {{ respond ready }}\nhttp://localhost {{ respond paid rate_limit 1/s burst 1 pay 2 sat {mint_url} }}\n"
     );
     let policy =
         format!("cashu_payout {{ mint {mint_url} request {payment} max_fee 10 threshold 50 }}\n");
@@ -907,7 +929,7 @@ fn scheduled_nostr_payout_delivers_an_encrypted_payment() -> anyhow::Result<()> 
     std::fs::write(
         root.path().join("Geatafile"),
         format!(
-            "http://ready.local {{ respond ready }}\nhttp://localhost {{ respond paid rate_limit 1/s burst 1 pay_over_limit 2 sat {mint_url} }}\ncashu_payout {{ mint {mint_url} request {payment} interval 2s max_fee 10 }}"
+            "http://ready.local {{ respond ready }}\nhttp://localhost {{ respond paid rate_limit 1/s burst 1 pay 2 sat {mint_url} }}\ncashu_payout {{ mint {mint_url} request {payment} interval 2s max_fee 10 }}"
         ),
     )?;
     let (hp, tp) = (port()?, port()?);
@@ -974,8 +996,8 @@ lightning mint {{ mint {mint_url} network mainnet }}
 http://ready.local {{ respond ready }}
 http://localhost {{
     rate_limit 1/s burst 1
-    pay_over_limit 2 sat {mint_url}
-    lightning_over_limit 8 sat mint
+    pay 2 sat {mint_url}
+    lightning_pay 8 sat mint
     lightning_protocols l402
     lightning_headers none
     max_inflight 1

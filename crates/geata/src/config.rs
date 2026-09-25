@@ -226,12 +226,6 @@ impl Config {
             }
             let (handler, rate_limit, payment, lightning, max_inflight) =
                 parse_directives(body, line, &receivers, &domain, https)?;
-            if (payment.is_some() || lightning.is_some()) && rate_limit.is_none() {
-                return Err(error(
-                    line,
-                    "pay_over_limit and lightning_over_limit require rate_limit",
-                ));
-            }
             if let Some(policy) = &lightning {
                 policy
                     .check_site(&domain, https)
@@ -298,7 +292,7 @@ fn parse_directives(
         let line = tokens[start].line;
         let count = match tokens[start].text() {
             Some("reverse_proxy") => 2,
-            Some("rate_limit" | "pay_over_limit" | "lightning_over_limit") => 4,
+            Some("rate_limit" | "pay" | "lightning_pay") => 4,
             Some("max_inflight" | "lightning_origin") => 2,
             Some("lightning_headers" | "lightning_protocols") => {
                 1 + tokens[start + 1..]
@@ -322,14 +316,12 @@ fn parse_directives(
             message: message.to_owned(),
         };
         match args[0].text() {
-            Some("lightning_over_limit") => {
+            Some("lightning_pay") => {
                 if lightning.is_some() {
-                    return Err(error("duplicate lightning_over_limit directive"));
+                    return Err(error("duplicate lightning_pay directive"));
                 }
                 if args.len() != 4 {
-                    return Err(error(
-                        "expected lightning_over_limit <price> sat <receiver name>",
-                    ));
+                    return Err(error("expected lightning_pay <price> sat <receiver name>"));
                 }
                 lightning = Some((
                     args[1].text().unwrap_or_default(),
@@ -382,12 +374,12 @@ fn parse_directives(
                 }
                 lightning_origin = Some(args[1].text().unwrap_or_default().to_owned());
             }
-            Some("pay_over_limit") => {
+            Some("pay") => {
                 if payment.is_some() {
-                    return Err(error("duplicate pay_over_limit directive"));
+                    return Err(error("duplicate pay directive"));
                 }
                 if args.len() != 4 {
-                    return Err(error("expected pay_over_limit <price> sat <mint URL>"));
+                    return Err(error("expected pay <price> sat <mint URL>"));
                 }
                 payment = Some(
                     PaymentPolicy::parse(
@@ -452,7 +444,7 @@ fn parse_directives(
             }
             _ => {
                 return Err(error(
-                    "unknown directive; expected reverse_proxy, respond, rate_limit, pay_over_limit, lightning_over_limit, lightning_headers, lightning_origin, lightning_protocols, or max_inflight",
+                    "unknown directive; expected reverse_proxy, respond, rate_limit, pay, lightning_pay, lightning_headers, lightning_origin, lightning_protocols, or max_inflight",
                 ));
             }
         }
@@ -474,7 +466,7 @@ fn parse_directives(
             let receiver = receivers
                 .get(name)
                 .ok_or_else(|| error(&format!("unknown Lightning receiver: {name}")))?;
-            let headers = lightning_headers.ok_or_else(|| error("lightning_over_limit requires lightning_headers; use none only when no headers affect the request"))?;
+            let headers = lightning_headers.ok_or_else(|| error("lightning_pay requires lightning_headers; use none only when no headers affect the request"))?;
             let origin = lightning_origin
                 .unwrap_or_else(|| format!("{}://{domain}", if https { "https" } else { "http" }));
             Some(
@@ -495,7 +487,7 @@ fn parse_directives(
                 || lightning_protocols.is_some()
             {
                 return Err(error(
-                    "lightning_headers, lightning_origin, and lightning_protocols require lightning_over_limit",
+                    "lightning_headers, lightning_origin, and lightning_protocols require lightning_pay",
                 ));
             }
             None
@@ -511,8 +503,8 @@ fn site_directive(value: Option<&str>) -> bool {
             "reverse_proxy"
                 | "respond"
                 | "rate_limit"
-                | "pay_over_limit"
-                | "lightning_over_limit"
+                | "pay"
+                | "lightning_pay"
                 | "lightning_headers"
                 | "lightning_protocols"
                 | "lightning_origin"
@@ -829,21 +821,27 @@ mod tests {
     }
 
     #[test]
-    fn paid_sites_require_a_free_allowance_and_have_a_capacity_cap() -> anyhow::Result<()> {
+    fn paid_sites_allow_optional_free_allowance_and_have_a_capacity_cap() -> anyhow::Result<()> {
         let config = Config::parse(
-            "http://localhost { respond ok pay_over_limit 2 sat https://mint.example.com rate_limit 1/s burst 2 }",
+            "http://localhost { respond ok pay 2 sat https://mint.example.com rate_limit 1/s burst 2 }",
         )?;
         let site = &config.sites["localhost"];
         assert_eq!(site.payment.as_ref().expect("payment").price, 2);
         assert_eq!(site.capacity.as_ref().expect("capacity").max, 128);
+        let always_paid =
+            Config::parse("http://localhost { respond ok pay 2 sat https://mint.example.com }")?;
+        let site = &always_paid.sites["localhost"];
+        assert!(site.rate_limit.is_none());
+        assert_eq!(site.payment.as_ref().expect("payment").price, 2);
+        assert_eq!(site.capacity.as_ref().expect("capacity").max, 128);
         for body in [
             "respond ok pay_over_limit 2 sat https://mint.example.com",
-            "respond ok rate_limit 1/s burst 2 pay_over_limit 0 sat https://mint.example.com",
-            "respond ok rate_limit 1/s burst 2 pay_over_limit 2 usd https://mint.example.com",
+            "respond ok rate_limit 1/s burst 2 pay 0 sat https://mint.example.com",
+            "respond ok rate_limit 1/s burst 2 pay 2 usd https://mint.example.com",
             "respond ok max_inflight 0",
             "respond ok max_inflight 1000001",
             "respond ok max_inflight 1 max_inflight 2",
-            "respond ok rate_limit 1/s burst 2 pay_over_limit 2 sat https://mint.example.com pay_over_limit 3 sat https://mint.example.com",
+            "respond ok rate_limit 1/s burst 2 pay 2 sat https://mint.example.com pay 3 sat https://mint.example.com",
         ] {
             assert!(
                 Config::parse(&format!("http://localhost {{ {body} }}")).is_err(),

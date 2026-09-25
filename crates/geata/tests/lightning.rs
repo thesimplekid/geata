@@ -343,7 +343,7 @@ async fn admission(l402: bool) -> anyhow::Result<()> {
     std::fs::write(
         &config,
         format!(
-            "lightning node {{ endpoint https://localhost:{receiver_port} api_key_file {} tls_cert_file {} pay_to 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 network mainnet }}\nhttp://localhost {{\nrate_limit 1/s burst 1\npay_over_limit 2 sat https://mint.example.com\nlightning_over_limit 25 sat node\nlightning_headers {}\n{}\nlightning_origin http://localhost:{port}\nreverse_proxy 127.0.0.1:{backend_port}\n}}",
+            "lightning node {{ endpoint https://localhost:{receiver_port} api_key_file {} tls_cert_file {} pay_to 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 network mainnet }}\nhttp://localhost {{\nrate_limit 1/s burst 1\npay 2 sat https://mint.example.com\nlightning_pay 25 sat node\nlightning_headers {}\n{}\nlightning_origin http://localhost:{port}\nreverse_proxy 127.0.0.1:{backend_port}\n}}",
             root.path().join("api_key").display(),
             root.path().join("tls.crt").display(),
             if l402 {
@@ -492,11 +492,14 @@ async fn admission(l402: bool) -> anyhow::Result<()> {
     }
     drop(process);
     backend_thread.join().expect("backend thread")?;
-    // Restart into a direct-response handler while preserving the replay database.
-    let updated = std::fs::read_to_string(&config)?.replace(
-        &format!("reverse_proxy 127.0.0.1:{backend_port}"),
-        "respond admitted",
-    );
+    // Restart into an always-paid Lightning-only handler, preserving the replay database.
+    let updated = std::fs::read_to_string(&config)?
+        .replace("rate_limit 1/s burst 1\n", "")
+        .replace("pay 2 sat https://mint.example.com\n", "")
+        .replace(
+            &format!("reverse_proxy 127.0.0.1:{backend_port}"),
+            "respond admitted",
+        );
     std::fs::write(&config, updated)?;
     let _process = start()?;
     assert_eq!(
@@ -511,9 +514,10 @@ async fn admission(l402: bool) -> anyhow::Result<()> {
         .0,
         invalid_status
     );
-    assert_eq!(request(port, "GET", "/", None, "", b"")?.0, 200);
     let (status, challenge) = request(port, "GET", "/", None, "", b"")?;
     assert_eq!(status, 402);
+    assert!(header(&challenge, "retry-after").is_none());
+    assert!(header(&challenge, "x-cashu").is_none());
     let paid = selected_proof(&challenge, 2, l402)?;
     let (status, response) = request(port, "GET", "/", Some(&paid), "", b"")?;
     assert_eq!(status, 200);
@@ -524,7 +528,6 @@ async fn admission(l402: bool) -> anyhow::Result<()> {
             .replace("lightning_protocols x402 l402", "lightning_protocols l402");
         std::fs::write(&config, updated)?;
         let process = start()?;
-        assert_eq!(request(port, "GET", "/", None, "", b"")?.0, 200);
         let (status, challenge) = request(port, "GET", "/", None, "", b"")?;
         assert_eq!(status, 402);
         assert!(header(&challenge, "payment-required").is_none());

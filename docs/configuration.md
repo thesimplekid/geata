@@ -1,7 +1,7 @@
 # Configuration
 
 Each site has exactly one `reverse_proxy` or `respond` directive, with optional
-`rate_limit`, `pay_over_limit`, `lightning_over_limit`, `lightning_protocols`, `lightning_headers`,
+`rate_limit`, `pay`, `lightning_pay`, `lightning_protocols`, `lightning_headers`,
 `lightning_origin`, and `max_inflight` settings. Braces can
 appear on one line or multiple lines. Blank lines and `#` comments outside quoted
 strings are supported.
@@ -19,6 +19,22 @@ http://localhost {
     respond "Hello world!"
 }
 ```
+
+## Payment and free allowances
+
+Use `pay` for Cashu or `lightning_pay` for Lightning. Without `rate_limit`,
+every request to the site's handler requires payment:
+
+```caddyfile
+example.com {
+    pay 2 sat https://mint.example.com
+    reverse_proxy localhost:3000
+}
+```
+
+Add `rate_limit 10/s burst 20` to grant each IP a free allowance before requiring
+payment. Without either payment directive, an exhausted rate limit returns 429.
+Without payment directives or a rate limit, requests are unrestricted by either.
 
 ## Direct responses
 
@@ -75,7 +91,7 @@ An optional top-level `cashu_payout { ... }` block configures scheduled or
 balance-triggered [operator payouts](payouts.md), one block per mint.
 
 A top-level `lightning <name> { ... }` block defines a shared LDK Server or Cashu mint receiver.
-Sites reference its name with `lightning_over_limit` and select their own bound
+Sites reference its name with `lightning_pay` and select their own bound
 headers with `lightning_headers`. Mint receivers require `lightning_protocols l402`.
 See [Lightning payments](lightning.md) for the
 complete syntax and credential paths.

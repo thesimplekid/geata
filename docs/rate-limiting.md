@@ -55,5 +55,7 @@ for i in $(seq 1 10); do curl -i http://localhost:8080/; done
 
 To offer paid access when the free allowance is exhausted, see
 [Cashu payments](cashu.md).
+With `pay` or `lightning_pay`, omitting `rate_limit` requires payment for every
+request. Zero rates and burst sizes remain invalid.
 
 Back to [Geata](../README.md).

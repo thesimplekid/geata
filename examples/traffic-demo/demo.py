@@ -196,7 +196,7 @@ def main():
             config.write_text(f'''http://ready.local {{ respond "ready" }}
 http://localhost {{
     rate_limit {args.rate}/s burst {args.burst}
-    pay_over_limit {args.price} sat {json.dumps(args.mint)}
+    pay {args.price} sat {json.dumps(args.mint)}
     max_inflight 128
     reverse_proxy 127.0.0.1:{server.server_port}
 }}
