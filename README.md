@@ -14,17 +14,37 @@ invoice and retry with the payment proof. Geata verifies and settles the payment
 before forwarding the request, so your backend does not need payment logic.
 
 ```caddyfile
+lightning my_node {
+    endpoint https://localhost:3536
+    api_key_file /var/lib/ldk-server/bitcoin/api_key
+    tls_cert_file /var/lib/ldk-server/tls.crt
+    network mainnet
+    pay_to YOUR_66_CHARACTER_COMPRESSED_NODE_PUBLIC_KEY
+}
+
 example.com {
     rate_limit 10/s burst 20
     pay_over_limit 2 sat https://mint.example.com
+    lightning_over_limit 2 sat my_node
+    lightning_protocols x402 l402
+    lightning_headers accept content-encoding content-type cookie range
     reverse_proxy localhost:3000
 }
 ```
 
 Here, each IP gets a bucket of 20 free requests that refills at 10 per second.
-A paid request costs a fixed **2 sats plus mint fees**; the price does not rise
-with traffic. Payment buys one request attempt. See [Cashu payments](docs/cashu.md)
-for token requirements, excess payments, and recovery.
+Beyond that allowance, clients can pay with **Cashu tokens, Lightning x402, or
+Lightning L402**. Each method costs a fixed **2 sats** per request attempt;
+Cashu also requires mint input fees, and Lightning routing fees may apply.
+The price does not rise with traffic.
+
+Try the [hosted example endpoint](https://pay.geata.thesimplekid.dev), or use the
+[Rust client example](examples/README.md) to walk through a Lightning payment.
+
+The Lightning receiver requires a separate LDK Server with incoming liquidity.
+Replace its endpoint, credential paths, and node public key with your own values.
+See [Lightning payments](docs/lightning.md) for setup and
+[Cashu payments](docs/cashu.md) for token requirements and recovery.
 
 Built on Pingora, Geata can also serve plain-text responses directly.
 
@@ -66,9 +86,9 @@ In another terminal, run `curl http://localhost:8080`.
 
 ## Use your domain
 
-Replace the example domain and mint URL above with your own, then save the
-configuration as `Geatafile`. Point your domain's DNS at the server and make
-ports 80 and 443 reachable. Then run:
+Replace the example domain, mint URL, backend address, and LDK receiver settings
+above with your own, then save the configuration as `Geatafile`. Point your
+domain's DNS at the server and make ports 80 and 443 reachable. Then run:
 
 ```sh
 ./result/bin/geata validate

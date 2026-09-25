@@ -12,6 +12,7 @@ example.com {
     rate_limit 10/s burst 20
     pay_over_limit 2 sat https://mint.example.com
     lightning_over_limit 2 sat my_node
-    lightning_headers accept authorization content-encoding content-type cookie range
+    lightning_protocols x402 l402
+    lightning_headers accept content-encoding content-type cookie range
     reverse_proxy localhost:3000
 }
