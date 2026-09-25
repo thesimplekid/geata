@@ -80,6 +80,7 @@
                 }
                 ''
                   python3 ${./tests}/smoke.py ${package}/bin/geata --pebble-bin ${pkgs.pebble}/bin
+                  python3 ${./tests}/request_controls.py ${package}/bin/geata
                   touch $out
                 '';
           };

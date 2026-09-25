@@ -27,6 +27,12 @@ impl State {
     pub fn replace_config(&self, mut config: Config) {
         let previous = self.config.load();
         for (domain, site) in &mut config.sites {
+            if let Some(old) = previous.sites.get(domain)
+                && site.payment_verification.limit == old.payment_verification.limit
+                && site.payment_verification.ipv6_prefix == old.payment_verification.ipv6_prefix
+            {
+                site.payment_verification = old.payment_verification.clone();
+            }
             if let (Some(next), Some(old)) = (
                 &site.capacity,
                 previous
@@ -34,6 +40,7 @@ impl State {
                     .get(domain)
                     .and_then(|site| site.capacity.as_ref()),
             ) && next.max == old.max
+                && next.ipv6_prefix == old.ipv6_prefix
             {
                 site.capacity = Some(old.clone());
             }
@@ -44,6 +51,7 @@ impl State {
                     .get(domain)
                     .and_then(|site| site.rate_limit.as_ref()),
             ) && next.limit == old.limit
+                && next.ipv6_prefix == old.ipv6_prefix
             {
                 site.rate_limit = Some(Arc::clone(old));
             }
@@ -55,6 +63,30 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_preserves_payment_attempts_and_respects_prefix_changes() -> anyhow::Result<()> {
+        let parse = |prefix| {
+            Config::parse(&format!(
+                "http://localhost {{ respond ok ipv6_prefix {prefix} }}"
+            ))
+        };
+        let state = State::new(parse(64)?);
+        let old = state.config.load().sites["localhost"]
+            .payment_verification
+            .clone();
+        state.replace_config(parse(64)?);
+        assert!(Arc::ptr_eq(
+            &old,
+            &state.config.load().sites["localhost"].payment_verification
+        ));
+        state.replace_config(parse(48)?);
+        assert!(!Arc::ptr_eq(
+            &old,
+            &state.config.load().sites["localhost"].payment_verification
+        ));
+        Ok(())
+    }
 
     #[test]
     fn reload_preserves_unchanged_limits_and_drops_removed_or_changed_limits() -> anyhow::Result<()>

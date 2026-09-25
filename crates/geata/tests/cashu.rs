@@ -515,6 +515,8 @@ fn cashu_overflow(v2: bool, always_paid: bool) -> anyhow::Result<()> {
 http://ready.local {{ respond "ready" }}
 http://localhost {{
     {allowance}
+    # This fixture exercises settlement and capacity, with many sequential proofs.
+    payment_verify_limit 100/s burst 100
     pay 2 sat {mint_url}
     max_inflight 1
     reverse_proxy 127.0.0.1:{}

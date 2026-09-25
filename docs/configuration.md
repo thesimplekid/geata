@@ -2,7 +2,8 @@
 
 Each site has exactly one `reverse_proxy` or `respond` directive, with optional
 `rate_limit`, `pay`, `lightning_pay`, `lightning_protocols`, `lightning_headers`,
-`lightning_origin`, and `max_inflight` settings. Braces can
+`lightning_origin`, `max_inflight`, `max_body_bytes`, `request_timeout`,
+`ipv6_prefix`, and `payment_verify_limit` settings. Braces can
 appear on one line or multiple lines. Blank lines and `#` comments outside quoted
 strings are supported.
 

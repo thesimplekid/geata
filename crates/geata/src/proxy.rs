@@ -19,6 +19,116 @@ use crate::{
     state::State,
 };
 
+// The outer application owns the entire request future, so expiration also
+// cancels stalled reads, responses and upgraded streams, releasing capacity.
+tokio::task_local! {
+    static REQUEST_DEADLINE: tokio::sync::watch::Sender<Option<tokio::time::Instant>>;
+}
+
+pub struct BoundedProxy {
+    inner: Arc<pingora::proxy::HttpProxy<Proxy>>,
+}
+
+pub fn service(
+    conf: &Arc<pingora::server::configuration::ServerConf>,
+    proxy: Proxy,
+) -> pingora::services::listening::Service<BoundedProxy> {
+    pingora::services::listening::Service::new(
+        "Geata HTTP proxy".to_owned(),
+        BoundedProxy {
+            inner: Arc::new(pingora::proxy::http_proxy(conf, proxy)),
+        },
+    )
+}
+
+#[async_trait]
+impl pingora::apps::HttpServerApp for BoundedProxy {
+    async fn process_new_http(
+        self: &Arc<Self>,
+        session: pingora::protocols::http::ServerSession,
+        shutdown: &pingora::server::ShutdownWatch,
+    ) -> Option<pingora::apps::ReusedHttpStream> {
+        let (sender, mut receiver) = tokio::sync::watch::channel(Some(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        ));
+        let expiration = async {
+            loop {
+                let deadline = *receiver.borrow_and_update();
+                tokio::select! {
+                    _ = async {
+                        match deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => break,
+                    changed = receiver.changed() => {
+                        if changed.is_err() { std::future::pending::<()>().await; }
+                    }
+                }
+            }
+        };
+        REQUEST_DEADLINE
+            .scope(sender, async {
+                tokio::select! {
+                    result = self.inner.process_new_http(session, shutdown) => result,
+                    () = expiration => {
+                        record_rejection(408);
+                        None
+                    }
+                }
+            })
+            .await
+    }
+
+    async fn http_cleanup(&self) {
+        self.inner.http_cleanup().await;
+    }
+}
+
+// Process-wide, bounded-cardinality accounting: hostile hosts and paths are
+// never retained or logged for rejected traffic. At most one summary per 10s.
+struct RejectionLogs {
+    last: Instant,
+    counts: [u64; 600],
+}
+
+fn record_rejection(status: u16) {
+    static LOGS: std::sync::LazyLock<parking_lot::Mutex<RejectionLogs>> =
+        std::sync::LazyLock::new(|| {
+            parking_lot::Mutex::new(RejectionLogs {
+                last: Instant::now(),
+                counts: [0; 600],
+            })
+        });
+    let counts = LOGS.lock().record(status, Instant::now());
+    if let Some(counts) = counts {
+        tracing::info!(
+            ?counts,
+            "rejected or failed requests by status (0 = no response)"
+        );
+    }
+}
+
+impl RejectionLogs {
+    fn record(&mut self, status: u16, now: Instant) -> Option<Vec<(usize, u64)>> {
+        let index = usize::from(status).min(599);
+        self.counts[index] = self.counts[index].saturating_add(1);
+        if now.duration_since(self.last) < Duration::from_secs(10) {
+            return None;
+        }
+        let counts = self
+            .counts
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(status, count)| (status, *count))
+            .collect();
+        self.counts.fill(0);
+        self.last = now;
+        Some(counts)
+    }
+}
+
 pub struct Proxy {
     pub state: Arc<State>,
     pub tls: bool,
@@ -33,6 +143,7 @@ pub struct RequestContext {
     address_index: usize,
     _capacity: Option<CapacityPermit>,
     lightning_receipt: Option<String>,
+    body_bytes: u64,
 }
 
 #[async_trait]
@@ -48,6 +159,7 @@ impl ProxyHttp for Proxy {
             address_index: 0,
             _capacity: None,
             lightning_receipt: None,
+            body_bytes: 0,
         }
     }
 
@@ -115,10 +227,52 @@ impl ProxyHttp for Proxy {
             )
             .await;
         }
+        let deadline = site.controls.request_timeout.map(|seconds| {
+            tokio::time::Instant::from_std(ctx.started) + Duration::from_secs(seconds)
+        });
+        let _ = REQUEST_DEADLINE.try_with(|sender| sender.send_replace(deadline));
+        ctx.site = Some(site.clone());
+        if let Some(max) = site.controls.max_body_bytes
+            && session
+                .req_header()
+                .headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|length| length > max)
+        {
+            return respond(session, 413, "Request body too large.\n", None).await;
+        }
         let client = session
             .client_addr()
             .and_then(|address| address.as_inet())
             .map(|address| address.ip());
+        let payment_attempt = (site.payment.is_some()
+            && session.req_header().headers.contains_key("x-cashu"))
+            || (site.lightning.is_some()
+                && (session
+                    .req_header()
+                    .headers
+                    .contains_key("payment-signature")
+                    || session.req_header().headers.contains_key("authorization")));
+        if payment_attempt {
+            let client = client.ok_or_else(|| {
+                Error::explain(ErrorType::InternalError, "request has no client IP")
+            })?;
+            if let Err(wait) = site.payment_verification.check(client) {
+                let retry = wait
+                    .as_secs()
+                    .saturating_add(u64::from(wait.subsec_nanos() != 0))
+                    .to_string();
+                return respond_with_headers(
+                    session,
+                    429,
+                    "Too many payment verification attempts.\n",
+                    &[("Retry-After", &retry), ("Cache-Control", "no-store")],
+                )
+                .await;
+            }
+        }
         if let Some(capacity) = &site.capacity {
             let client = client.ok_or_else(|| {
                 Error::explain(ErrorType::InternalError, "request has no client IP")
@@ -221,7 +375,8 @@ impl ProxyHttp for Proxy {
             let Some(lightning) = &self.state.lightning else {
                 return respond(session, 503, "Lightning unavailable.\n", None).await;
             };
-            let binding = lightning_binding(session, policy, self.tls).await;
+            let binding =
+                lightning_binding(session, policy, self.tls, site.controls.max_body_bytes).await;
             let Ok((_, hash)) = binding else {
                 return respond(
                     session,
@@ -326,7 +481,13 @@ impl ProxyHttp for Proxy {
                     let mut required = None;
                     if let (Some(policy), Some(lightning)) =
                         (&site.lightning, &self.state.lightning)
-                        && let Ok((url, hash)) = lightning_binding(session, policy, self.tls).await
+                        && let Ok((url, hash)) = lightning_binding(
+                            session,
+                            policy,
+                            self.tls,
+                            site.controls.max_body_bytes,
+                        )
+                        .await
                     {
                         required = lightning.challenge(policy, &url, &hash, client).await.ok();
                     }
@@ -398,6 +559,37 @@ impl ProxyHttp for Proxy {
         }
         ctx.site = Some(site);
         Ok(false)
+    }
+
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        // Upgraded frames are not HTTP request body bytes.
+        if session
+            .response_written()
+            .is_some_and(|r| r.status.as_u16() == 101)
+        {
+            return Ok(());
+        }
+        ctx.body_bytes = ctx
+            .body_bytes
+            .saturating_add(body.as_ref().map_or(0, |b| b.len() as u64));
+        if ctx
+            .site
+            .as_ref()
+            .and_then(|site| site.controls.max_body_bytes)
+            .is_some_and(|max| ctx.body_bytes > max)
+        {
+            return Err(Error::explain(
+                ErrorType::HTTPStatus(413),
+                "request body too large",
+            ));
+        }
+        Ok(())
     }
 
     async fn upstream_peer(
@@ -531,15 +723,32 @@ impl ProxyHttp for Proxy {
         Ok(())
     }
 
+    fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, _error: &Error) -> bool {
+        // Final failures are counted in logging(), without per-request output.
+        true
+    }
+
+    fn suppress_proxy_warn_log(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        _context: pingora::proxy::ProxyWarnLogContext,
+    ) -> bool {
+        record_rejection(0);
+        true
+    }
+
     async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX) {
         let status = session
             .response_written()
             .map(|r| r.status.as_u16())
             .unwrap_or(0);
-        tracing::info!(host = %ctx.host, method = %session.req_header().method, path = %session.req_header().uri.path(), status, elapsed_ms = ctx.started.elapsed().as_millis() as u64, failed = error.is_some(), "request");
-        if let Some(error) = error {
-            tracing::warn!(%error, "proxy request failed");
+        if status >= 400 || status == 0 || error.is_some() {
+            record_rejection(status);
+            return;
         }
+        tracing::info!(host = %ctx.host, method = %session.req_header().method, path = %session.req_header().uri.path(), status, elapsed_ms = ctx.started.elapsed().as_millis() as u64, failed = error.is_some(), "request");
     }
 }
 
@@ -585,6 +794,7 @@ async fn lightning_binding(
     session: &mut Session,
     policy: &crate::payments::lightning::Policy,
     tls: bool,
+    max_body_bytes: Option<u64>,
 ) -> anyhow::Result<(String, String)> {
     use anyhow::ensure;
     let header = session.req_header();
@@ -620,7 +830,10 @@ async fn lightning_binding(
         let mut body = Vec::new();
         while let Some(chunk) = session.read_request_body().await? {
             ensure!(
-                body.len() + chunk.len() <= crate::payments::lightning::MAX_BODY,
+                (body.len() + chunk.len()) as u64
+                    <= max_body_bytes
+                        .unwrap_or(u64::MAX)
+                        .min(crate::payments::lightning::MAX_BODY as u64),
                 "Lightning body exceeds 64 KiB"
             );
             body.extend_from_slice(&chunk);
@@ -640,4 +853,31 @@ async fn lightning_binding(
         Ok((url, hash))
     })
     .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejection_summaries_are_bounded_and_account_for_suppressed_events() {
+        let now = Instant::now();
+        let mut logs = RejectionLogs {
+            last: now,
+            counts: [0; 600],
+        };
+        for _ in 0..10_000 {
+            assert!(logs.record(429, now).is_none());
+        }
+        assert!(logs.record(503, now).is_none());
+        assert_eq!(
+            logs.record(408, now + Duration::from_secs(10)),
+            Some(vec![(408, 1), (429, 10_000), (503, 1)])
+        );
+        assert!(logs.record(404, now + Duration::from_secs(10)).is_none());
+        assert_eq!(
+            logs.record(404, now + Duration::from_secs(20)),
+            Some(vec![(404, 2)])
+        );
+    }
 }

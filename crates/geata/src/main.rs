@@ -249,7 +249,7 @@ fn main() -> anyhow::Result<()> {
             };
             let mut server = Server::new_with_opt_and_conf(None, conf);
             server.bootstrap();
-            let mut http = pingora::proxy::http_proxy_service(
+            let mut http = proxy::service(
                 &server.configuration,
                 Proxy {
                     state: state.clone(),
@@ -258,7 +258,7 @@ fn main() -> anyhow::Result<()> {
                 },
             );
             http.add_tcp(&http_listen.to_string());
-            let mut https = pingora::proxy::http_proxy_service(
+            let mut https = proxy::service(
                 &server.configuration,
                 Proxy {
                     state: state.clone(),

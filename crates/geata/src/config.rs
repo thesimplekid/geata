@@ -38,11 +38,36 @@ pub struct Site {
     pub payment: Option<PaymentPolicy>,
     pub lightning: Option<crate::payments::lightning::Policy>,
     pub capacity: Option<Capacity>,
+    pub controls: RequestControls,
+    pub payment_verification: Arc<RateLimiter>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestControls {
+    pub max_body_bytes: Option<u64>,
+    pub request_timeout: Option<u64>,
+    pub ipv6_prefix: u8,
+    pub payment_limit: Limit,
+}
+
+impl Default for RequestControls {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: Some(10 * 1024 * 1024),
+            request_timeout: Some(60),
+            ipv6_prefix: 64,
+            payment_limit: Limit {
+                per_second: 2,
+                burst: 8,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Capacity {
     pub max: u32,
+    pub ipv6_prefix: u8,
     per_client: u32,
     permits: Arc<Semaphore>,
     clients: Arc<Mutex<HashMap<IpAddr, u32>>>,
@@ -58,6 +83,7 @@ impl Capacity {
     fn new(max: u32) -> Self {
         Self {
             max,
+            ipv6_prefix: 64,
             // For limits above one, reserve at least half of the site's capacity
             // for other client addresses. A limit of one is inherently exclusive.
             per_client: (max / 2).max(1),
@@ -67,7 +93,7 @@ impl Capacity {
     }
 
     pub fn try_acquire(&self, client: IpAddr) -> Option<CapacityPermit> {
-        let client = client.to_canonical();
+        let client = crate::rate_limit::client_key(client, self.ipv6_prefix);
         let mut clients = self.clients.lock();
         if clients.get(&client).copied().unwrap_or(0) >= self.per_client {
             return None;
@@ -224,23 +250,32 @@ impl Config {
                 payouts.push(payout);
                 continue;
             }
-            let (handler, rate_limit, payment, lightning, max_inflight) =
+            let (handler, rate_limit, payment, lightning, max_inflight, controls) =
                 parse_directives(body, line, &receivers, &domain, https)?;
             if let Some(policy) = &lightning {
                 policy
                     .check_site(&domain, https)
                     .map_err(|e| error(line, &e.to_string()))?;
             }
-            let max_inflight =
-                max_inflight.or_else(|| (payment.is_some() || lightning.is_some()).then_some(128));
+            let max_inflight = Some(max_inflight.unwrap_or(128)).filter(|max| *max != 0);
             let site = Site {
                 domain: domain.clone(),
                 https,
                 handler,
-                rate_limit: rate_limit.map(|limit| Arc::new(RateLimiter::new(limit))),
+                rate_limit: rate_limit
+                    .map(|limit| Arc::new(RateLimiter::with_prefix(limit, controls.ipv6_prefix))),
                 payment,
                 lightning,
-                capacity: max_inflight.map(Capacity::new),
+                capacity: max_inflight.map(|max| {
+                    let mut capacity = Capacity::new(max);
+                    capacity.ipv6_prefix = controls.ipv6_prefix;
+                    capacity
+                }),
+                payment_verification: Arc::new(RateLimiter::with_prefix(
+                    controls.payment_limit,
+                    controls.ipv6_prefix,
+                )),
+                controls,
             };
             if sites.insert(domain.clone(), site).is_some() {
                 return Err(error(line, &format!("duplicate site {domain}")));
@@ -269,6 +304,7 @@ type ParsedDirectives = (
     Option<PaymentPolicy>,
     Option<crate::payments::lightning::Policy>,
     Option<u32>,
+    RequestControls,
 );
 
 fn parse_directives(
@@ -286,14 +322,19 @@ fn parse_directives(
     let mut lightning_origin = None;
     let mut lightning_protocols = None;
     let mut max_inflight = None;
+    let mut controls = RequestControls::default();
+    let mut seen_controls = std::collections::HashSet::new();
     let mut cursor = 0;
     while cursor < tokens.len() {
         let start = cursor;
         let line = tokens[start].line;
         let count = match tokens[start].text() {
             Some("reverse_proxy") => 2,
-            Some("rate_limit" | "pay" | "lightning_pay") => 4,
-            Some("max_inflight" | "lightning_origin") => 2,
+            Some("rate_limit" | "payment_verify_limit" | "pay" | "lightning_pay") => 4,
+            Some(
+                "max_inflight" | "max_body_bytes" | "request_timeout" | "ipv6_prefix"
+                | "lightning_origin",
+            ) => 2,
             Some("lightning_headers" | "lightning_protocols") => {
                 1 + tokens[start + 1..]
                     .iter()
@@ -397,17 +438,58 @@ fn parse_directives(
                 max_inflight = args
                     .get(1)
                     .and_then(Token::text)
-                    .and_then(|text| text.parse::<u32>().ok())
-                    .filter(|max| (1..=1_000_000).contains(max));
+                    .and_then(|text| {
+                        if text == "off" {
+                            Some(0)
+                        } else {
+                            text.parse::<u32>().ok().filter(|n| *n > 0)
+                        }
+                    })
+                    .filter(|max| *max <= 1_000_000);
                 if max_inflight.is_none() {
-                    return Err(error("max_inflight must be between 1 and 1000000"));
+                    return Err(error("max_inflight must be off or between 1 and 1000000"));
                 }
             }
-            Some("rate_limit") => {
-                if rate_limit.is_some() {
-                    return Err(error("duplicate rate_limit directive"));
+            Some(name @ ("max_body_bytes" | "request_timeout" | "ipv6_prefix")) => {
+                if !seen_controls.insert(name) {
+                    return Err(error("duplicate request control"));
                 }
-                let syntax = "expected rate_limit <positive integer>/s burst <positive integer>";
+                let value = args
+                    .get(1)
+                    .and_then(Token::text)
+                    .ok_or_else(|| error("missing request control value"))?;
+                if name == "ipv6_prefix" {
+                    controls.ipv6_prefix = value
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|n| *n <= 128)
+                        .ok_or_else(|| error("ipv6_prefix must be 0 through 128"))?;
+                } else {
+                    let value = if value == "off" {
+                        None
+                    } else {
+                        let syntax =
+                            "request control must be off or a positive integer up to 4294967295";
+                        Some(
+                            value
+                                .parse::<u64>()
+                                .ok()
+                                .filter(|n| *n > 0 && *n <= u32::MAX.into())
+                                .ok_or_else(|| error(syntax))?,
+                        )
+                    };
+                    if name == "max_body_bytes" {
+                        controls.max_body_bytes = value;
+                    } else {
+                        controls.request_timeout = value;
+                    }
+                }
+            }
+            Some(name @ ("rate_limit" | "payment_verify_limit")) => {
+                if !seen_controls.insert(name) {
+                    return Err(error(&format!("duplicate {name} directive")));
+                }
+                let syntax = "expected rate limit <positive integer>/s burst <positive integer>";
                 if args.len() != 4 || args[2].text() != Some("burst") {
                     return Err(error(syntax));
                 }
@@ -425,7 +507,12 @@ fn parse_directives(
                     .text()
                     .and_then(positive)
                     .ok_or_else(|| error(syntax))?;
-                rate_limit = Some(Limit { per_second, burst });
+                let limit = Limit { per_second, burst };
+                if name == "rate_limit" {
+                    rate_limit = Some(limit);
+                } else {
+                    controls.payment_limit = limit;
+                }
             }
             Some("reverse_proxy" | "respond") => {
                 if handler.is_some() {
@@ -444,7 +531,7 @@ fn parse_directives(
             }
             _ => {
                 return Err(error(
-                    "unknown directive; expected reverse_proxy, respond, rate_limit, pay, lightning_pay, lightning_headers, lightning_origin, lightning_protocols, or max_inflight",
+                    "unknown directive; expected reverse_proxy, respond, rate_limit, pay, lightning_pay, lightning_headers, lightning_origin, lightning_protocols, max_inflight, max_body_bytes, request_timeout, ipv6_prefix, or payment_verify_limit",
                 ));
             }
         }
@@ -493,7 +580,14 @@ fn parse_directives(
             None
         }
     };
-    Ok((handler, rate_limit, payment, lightning, max_inflight))
+    Ok((
+        handler,
+        rate_limit,
+        payment,
+        lightning,
+        max_inflight,
+        controls,
+    ))
 }
 
 fn site_directive(value: Option<&str>) -> bool {
@@ -508,6 +602,10 @@ fn site_directive(value: Option<&str>) -> bool {
                 | "lightning_headers"
                 | "lightning_protocols"
                 | "lightning_origin"
+                | "max_body_bytes"
+                | "request_timeout"
+                | "ipv6_prefix"
+                | "payment_verify_limit"
                 | "max_inflight"
         )
     )
@@ -849,6 +947,68 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn request_controls_default_override_and_validate() -> anyhow::Result<()> {
+        let config = Config::parse("http://localhost { reverse_proxy localhost:3000 }")?;
+        let site = &config.sites["localhost"];
+        assert_eq!(site.capacity.as_ref().expect("capacity").max, 128);
+        assert_eq!(site.controls.max_body_bytes, Some(10 * 1024 * 1024));
+        assert_eq!(site.controls.request_timeout, Some(60));
+        let config = Config::parse(
+            "http://localhost { max_inflight off max_body_bytes off request_timeout off ipv6_prefix 48 payment_verify_limit 3/s burst 4 respond ok }",
+        )?;
+        let site = &config.sites["localhost"];
+        assert!(site.capacity.is_none());
+        assert_eq!(site.controls.max_body_bytes, None);
+        assert_eq!(site.controls.request_timeout, None);
+        assert_eq!(site.payment_verification.ipv6_prefix, 48);
+        assert_eq!(
+            site.payment_verification.limit,
+            Limit {
+                per_second: 3,
+                burst: 4
+            }
+        );
+        for directive in [
+            "max_body_bytes 0",
+            "request_timeout 0",
+            "request_timeout 4294967296",
+            "ipv6_prefix 129",
+            "ipv6_prefix -1",
+            "payment_verify_limit 0/s burst 1",
+            "request_timeout off request_timeout 1",
+            "ipv6_prefix 64 ipv6_prefix 48",
+            "payment_verify_limit 1/s burst 1 payment_verify_limit 2/s burst 2",
+        ] {
+            assert!(
+                Config::parse(&format!("http://localhost {{ respond ok {directive} }}")).is_err(),
+                "accepted {directive}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ipv6_capacity_is_shared_by_prefix() {
+        let capacity = Capacity::new(4);
+        let _a = capacity
+            .try_acquire("2001:db8::1".parse().expect("IP"))
+            .expect("permit");
+        let _b = capacity
+            .try_acquire("2001:db8::2".parse().expect("IP"))
+            .expect("permit");
+        assert!(
+            capacity
+                .try_acquire("2001:db8::3".parse().expect("IP"))
+                .is_none()
+        );
+        assert!(
+            capacity
+                .try_acquire("2001:db8:0:1::1".parse().expect("IP"))
+                .is_some()
+        );
     }
 
     #[test]

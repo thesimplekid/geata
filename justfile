@@ -43,6 +43,9 @@ lightning:
 rate-limits: build
     python3 tests/rate_limits.py "${CARGO_TARGET_DIR:-target}/debug/geata"
 
+request-controls: build
+    python3 tests/request_controls.py "${CARGO_TARGET_DIR:-target}/debug/geata"
+
 regressions: build
     python3 tests/regressions.py "${CARGO_TARGET_DIR:-target}/debug/geata"
 

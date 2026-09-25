@@ -59,10 +59,13 @@ Other sites retain their existing forwarding behavior.
 ## Capacity limits
 
 `max_inflight` caps simultaneous requests, including payment verification and
-streaming responses. It defaults to 128 on paid sites and can also be set on
-ordinary sites. When the limit is greater than one, a single client IP can use
+streaming responses. It defaults to 128 on every site. When the limit is greater
+than one, a single client identity (IPv4 address or IPv6 /64 by default) can use
 at most half of it, leaving capacity for other clients. At capacity, Geata
-returns 503 **without redeeming a token**.
+returns 503 **without redeeming a token**. A separate payment-verification
+bucket defaults to 2 attempts/s with a burst of 8; exhaustion returns 429 before
+redemption. See [request controls](rate-limiting.md#resource-and-payment-verification-controls)
+for body and duration limits, IPv6 aggregation, and configuration overrides.
 Mint operations are serialized per mint; concurrent payment attempts may also
 receive 503 with `Retry-After`. Use HTTPS for public payments; HTTP mint URLs and
 HTTP token submission are supported only for loopback testing.

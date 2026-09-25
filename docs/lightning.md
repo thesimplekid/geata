@@ -51,8 +51,10 @@ and references to undefined receivers are rejected by `geata validate`.
 Omit `rate_limit` to require payment for every request, or add it to grant a free
 allowance before payment is required. Prices are positive whole sats, converted exactly to
 millisatoshis on the wire. Cashu and Lightning prices may differ. Omit
-`pay` for Lightning only. The default `max_inflight` is 128 when either
-payment method is enabled.
+`pay` for Lightning only. The default `max_inflight` is 128 on every site. Payment
+verification has a separate per-client limit of 2 attempts/s with a burst of 8,
+including malformed credentials. See [request controls](rate-limiting.md#resource-and-payment-verification-controls)
+for overrides, IPv6 aggregation, and body and duration limits.
 
 `lightning_headers <names...>` explicitly selects the site's bound headers in
 lowercase sorted order. Use `lightning_headers none` only when no header affects

@@ -22,6 +22,7 @@ pub struct Limit {
 #[derive(Debug)]
 pub struct RateLimiter {
     pub limit: Limit,
+    pub ipv6_prefix: u8,
     hash: RandomState,
     shards: [Mutex<Shard>; SHARDS],
 }
@@ -41,8 +42,14 @@ struct Bucket {
 
 impl RateLimiter {
     pub fn new(limit: Limit) -> Self {
+        Self::with_prefix(limit, 64)
+    }
+
+    pub fn with_prefix(limit: Limit, ipv6_prefix: u8) -> Self {
+        assert!(ipv6_prefix <= 128);
         Self {
             limit,
+            ipv6_prefix,
             hash: RandomState::new(),
             shards: std::array::from_fn(|_| {
                 Mutex::new(Shard {
@@ -63,11 +70,24 @@ impl RateLimiter {
         clock: impl FnOnce() -> Instant,
     ) -> Result<(), Duration> {
         // An IPv4 address must keep the same bucket on a dual-stack listener.
-        let client = client.to_canonical();
+        let client = client_key(client, self.ipv6_prefix);
         let index = (self.hash.hash_one(client) % SHARDS as u64) as usize;
         let mut shard = self.shards[index].lock();
         // Sample after acquiring the lock so concurrent requests cannot move time backwards.
         shard.check(client, self.limit, clock())
+    }
+}
+
+/// Canonical IPv4 identities and a shared bucket for each configured IPv6 prefix.
+pub fn client_key(client: IpAddr, ipv6_prefix: u8) -> IpAddr {
+    match client.to_canonical() {
+        IpAddr::V6(ip) => {
+            let mask = u128::MAX
+                .checked_shl(u32::from(128 - ipv6_prefix))
+                .unwrap_or(0);
+            IpAddr::V6((u128::from(ip) & mask).into())
+        }
+        ip => ip,
     }
 }
 
@@ -147,6 +167,47 @@ mod tests {
         assert!(limiter.check_with_clock(IP, || now).is_ok());
         assert!(limiter.check_with_clock(mapped, || now).is_err());
         assert!(limiter.check_with_clock(other, || now).is_ok());
+    }
+
+    #[test]
+    fn rotating_ipv6_hosts_share_allowance_and_one_table_entry() {
+        let limiter = RateLimiter::new(Limit {
+            per_second: 1,
+            burst: 1,
+        });
+        let now = Instant::now();
+        let prefix = u128::from(
+            "2001:db8:1:2::"
+                .parse::<std::net::Ipv6Addr>()
+                .expect("prefix"),
+        );
+        for suffix in 0..20_000u128 {
+            let result = limiter.check_with_clock(IpAddr::V6((prefix | suffix).into()), || now);
+            assert_eq!(result.is_ok(), suffix == 0);
+        }
+        assert_eq!(
+            limiter
+                .shards
+                .iter()
+                .map(|s| s.lock().clients.len())
+                .sum::<usize>(),
+            1
+        );
+        assert!(
+            limiter
+                .check_with_clock("2001:db8:1:3::1".parse().expect("IP"), || now)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn configurable_prefix_handles_boundaries() {
+        let a = "2001:db8:1:2::1".parse().expect("IP");
+        let b = "2001:db8:1:3::2".parse().expect("IP");
+        assert_eq!(client_key(a, 48), client_key(b, 48));
+        assert_ne!(client_key(a, 64), client_key(b, 64));
+        assert_eq!(client_key(a, 128), a);
+        assert_eq!(client_key(a, 0), "::".parse::<IpAddr>().expect("IP"));
     }
 
     #[test]
