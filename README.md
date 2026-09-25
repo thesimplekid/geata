@@ -18,7 +18,7 @@ before forwarding the request, so your backend does not need payment logic.
 ```caddyfile
 lightning my_node {
     endpoint https://localhost:3536
-    api_key_file /var/lib/ldk-server/bitcoin/api_key
+    macaroon_file /var/lib/ldk-server/bitcoin/macaroons/geata.macaroon
     tls_cert_file /var/lib/ldk-server/tls.crt
     network mainnet
     pay_to YOUR_66_CHARACTER_COMPRESSED_NODE_PUBLIC_KEY

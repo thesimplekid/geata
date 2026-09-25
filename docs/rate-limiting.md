@@ -25,7 +25,10 @@ Limits use the connected client's IP, shared across worker threads. Forwarded
 headers cannot change the allowance. People sharing a public IP share its
 allowance; a CDN or another proxy in front of Geata also shares its connection
 IP's allowance, since trusted-proxy configuration is not yet supported.
-HTTP-to-HTTPS redirects and HTTP-01 challenge handling are exempt. WebSocket
+HTTP-to-HTTPS redirects use a separate process-wide per-client bucket of 10/s
+with burst 20, shared across hostnames and retained across reloads. They return
+429 when exhausted and do not spend the application allowance. Redirect logs
+are aggregated without paths or hostnames. HTTP-01 challenge handling is exempt. WebSocket
 handshakes count as requests; individual messages do not.
 
 ## Reloads and memory limits
@@ -60,6 +63,20 @@ request. Zero rates and burst sizes remain invalid.
 
 
 ## Resource and payment-verification controls
+
+Before HTTP parsing or TLS negotiation, each process caps connections at 1,024
+in total and 64 per client (IPv4 address or IPv6 /64), shared across both listeners.
+Excess connections are closed. These transport limits are independent of site
+settings and remain in force when site controls are disabled. TLS handshakes
+retain Pingora's 60-second timeout. HTTP/2 must complete negotiation and begin
+its first request within 10 seconds after TLS; thereafter connections with no
+active requests close after 30 seconds of idleness. Active requests retain their
+site deadlines. Connection slots are released on closure, including handshake
+failure or cancellation. Capacity rejections on both listeners enter the bounded
+rejection summary as status 0 (no response); the duplicate Pingora TLS error is
+suppressed. Client TLS accept failures and handshake timeouts share one log
+sample per ten seconds across the process. Accept failures, TLS setup errors,
+and internal listener errors retain their normal logging.
 
 Every site defaults to `max_inflight 128`, including sites without payments or
 rate limits. At most half the capacity can belong to one client identity (at
@@ -135,5 +152,9 @@ Apply the journal configuration through your deployment tooling. These settings
 bound the host journal, not only Geata. Container deployments need equivalent
 size and file-count limits in their logging driver. Application sampling does
 not replace storage rotation, including for dependency logs or successful traffic.
+
+On x402-only sites, backend `Authorization` headers do not consume the
+payment-verification allowance; they count as payment attempts only when L402
+is enabled.
 
 Back to [Geata](../README.md).

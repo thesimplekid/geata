@@ -7,6 +7,8 @@ use crate::{certificates::Certificate, config::Config, payments::Payments};
 
 pub struct State {
     pub config: ArcSwap<Config>,
+    pub connections: Arc<crate::connections::Connections>,
+    pub redirects: crate::rate_limit::RateLimiter,
     pub payments: Option<Arc<Payments>>,
     pub lightning: Option<Arc<crate::payments::lightning::Lightning>>,
     pub certificates: RwLock<HashMap<String, Arc<Certificate>>>,
@@ -17,6 +19,11 @@ impl State {
     pub fn new(config: Config) -> Self {
         Self {
             config: ArcSwap::from_pointee(config),
+            connections: Arc::new(crate::connections::Connections::default()),
+            redirects: crate::rate_limit::RateLimiter::new(crate::rate_limit::Limit {
+                per_second: 10,
+                burst: 20,
+            }),
             payments: None,
             lightning: None,
             certificates: RwLock::new(HashMap::new()),

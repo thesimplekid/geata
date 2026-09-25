@@ -106,7 +106,7 @@ private permissions and atomic certificate/key replacement. Never log private
 keys, ACME account credentials, or challenge responses.
 
 Lightning tests (`cargo test --test lightning`) use a local TLS/gRPC LDK Server
-fixture, verify HMAC authentication, and issue signed BOLT11 invoices without real
+fixture, verify request-bound macaroon authentication, and issue signed BOLT11 invoices without real
 funds. Keep request-binding vectors, replay persistence, header stripping, and
 Cashu coexistence covered when changing payment admission. See
 [Lightning payments](docs/lightning.md) for supported API and deployment limits.

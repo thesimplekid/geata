@@ -26,19 +26,24 @@ tokio::task_local! {
 }
 
 pub struct BoundedProxy {
-    inner: Arc<pingora::proxy::HttpProxy<Proxy>>,
+    pub(crate) inner: Arc<pingora::proxy::HttpProxy<Proxy>>,
+    pub(crate) ready: tokio::sync::watch::Sender<bool>,
 }
 
 pub fn service(
     conf: &Arc<pingora::server::configuration::ServerConf>,
     proxy: Proxy,
-) -> pingora::services::listening::Service<BoundedProxy> {
-    pingora::services::listening::Service::new(
+) -> pingora::services::listening::Service<crate::connections::ConnectionProxy> {
+    let connections = proxy.state.connections.clone();
+    let mut service = pingora::services::listening::Service::new(
         "Geata HTTP proxy".to_owned(),
-        BoundedProxy {
+        crate::connections::ConnectionProxy {
             inner: Arc::new(pingora::proxy::http_proxy(conf, proxy)),
+            connections: connections.clone(),
         },
-    )
+    );
+    service.endpoints().set_pre_tls_callback(connections);
+    service
 }
 
 #[async_trait]
@@ -48,6 +53,7 @@ impl pingora::apps::HttpServerApp for BoundedProxy {
         session: pingora::protocols::http::ServerSession,
         shutdown: &pingora::server::ShutdownWatch,
     ) -> Option<pingora::apps::ReusedHttpStream> {
+        self.ready.send_replace(true);
         let (sender, mut receiver) = tokio::sync::watch::channel(Some(
             tokio::time::Instant::now() + Duration::from_secs(60),
         ));
@@ -80,6 +86,10 @@ impl pingora::apps::HttpServerApp for BoundedProxy {
             .await
     }
 
+    fn server_options(&self) -> Option<&pingora::apps::HttpServerOptions> {
+        Some(crate::connections::http_options())
+    }
+
     async fn http_cleanup(&self) {
         self.inner.http_cleanup().await;
     }
@@ -92,7 +102,7 @@ struct RejectionLogs {
     counts: [u64; 600],
 }
 
-fn record_rejection(status: u16) {
+pub(crate) fn record_rejection(status: u16) {
     static LOGS: std::sync::LazyLock<parking_lot::Mutex<RejectionLogs>> =
         std::sync::LazyLock::new(|| {
             parking_lot::Mutex::new(RejectionLogs {
@@ -104,7 +114,7 @@ fn record_rejection(status: u16) {
     if let Some(counts) = counts {
         tracing::info!(
             ?counts,
-            "rejected or failed requests by status (0 = no response)"
+            "redirected, rejected or failed requests/connections by status (0 = no response)"
         );
     }
 }
@@ -205,6 +215,25 @@ impl ProxyHttp for Proxy {
                 };
             }
             if site.https {
+                let client = session
+                    .client_addr()
+                    .and_then(|a| a.as_inet())
+                    .map(|a| a.ip());
+                if let Err(wait) = client.map_or(Err(Duration::from_secs(1)), |ip| {
+                    self.state.redirects.check(ip)
+                }) {
+                    let retry = wait
+                        .as_secs()
+                        .saturating_add(u64::from(wait.subsec_nanos() != 0))
+                        .to_string();
+                    return respond_with_headers(
+                        session,
+                        429,
+                        "Too many redirects.\n",
+                        &[("Retry-After", &retry), ("Cache-Control", "no-store")],
+                    )
+                    .await;
+                }
                 let port = if self.https_port == 443 {
                     String::new()
                 } else {
@@ -254,7 +283,8 @@ impl ProxyHttp for Proxy {
                     .req_header()
                     .headers
                     .contains_key("payment-signature")
-                    || session.req_header().headers.contains_key("authorization")));
+                    || (site.lightning.as_ref().is_some_and(|p| p.protocols.l402)
+                        && session.req_header().headers.contains_key("authorization"))));
         if payment_attempt {
             let client = client.ok_or_else(|| {
                 Error::explain(ErrorType::InternalError, "request has no client IP")
@@ -744,7 +774,7 @@ impl ProxyHttp for Proxy {
             .response_written()
             .map(|r| r.status.as_u16())
             .unwrap_or(0);
-        if status >= 400 || status == 0 || error.is_some() {
+        if status >= 400 || status == 308 || status == 0 || error.is_some() {
             record_rejection(status);
             return;
         }
@@ -868,11 +898,12 @@ mod tests {
         };
         for _ in 0..10_000 {
             assert!(logs.record(429, now).is_none());
+            assert!(logs.record(0, now).is_none());
         }
         assert!(logs.record(503, now).is_none());
         assert_eq!(
             logs.record(408, now + Duration::from_secs(10)),
-            Some(vec![(408, 1), (429, 10_000), (503, 1)])
+            Some(vec![(0, 10_000), (408, 1), (429, 10_000), (503, 1)])
         );
         assert!(logs.record(404, now + Duration::from_secs(10)).is_none());
         assert_eq!(

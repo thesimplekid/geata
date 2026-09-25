@@ -12,12 +12,12 @@ license = "MIT"
 base64 = "0.22"
 bitcoin = "0.32"
 lightning-invoice = "0.34.1"
+ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "08316de8795a759eee08dc3873d32f980fbd0fe0" }
 macaroon = "0.3"
 prost = "0.14"
 http-body-util = "0.1"
 h2 = "0.4"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls-pemfile = "2"
 anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"
@@ -43,6 +43,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 tungstenite = "0.26.2"
 tracing = "0.1"
+tracing-log = "0.2"
+log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 

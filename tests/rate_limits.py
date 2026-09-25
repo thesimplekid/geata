@@ -115,9 +115,21 @@ http://proxy.local {{
         # Redirects must not consume the HTTPS allowance, and challenges bypass the limiter.
         for _ in range(5):
             assert request(hp, domain)[0] == 308
+        for _ in range(100):
+            status, headers, _ = request(hp, domain, "/redirect-log-marker")
+            if status == 429:
+                assert headers["Cache-Control"] == "no-store"
+                assert int(headers["Retry-After"]) >= 1
+                break
+            assert status == 308
+        else:
+            raise AssertionError("redirect allowance was not enforced")
+        assert request(hp, "ready.local")[0] == 200
+        time.sleep(0.1)
+        assert "redirect-log-marker" not in (root / "rate-limit-proxy.log").read_text()
         assert request(tp, domain, context=trust)[0] == 200
         exhaust(lambda: request(tp, domain, context=trust))
-        assert request(hp, domain)[0] == 308
+        assert request(hp, domain)[0] in (308, 429)
         assert request(hp, domain, "/.well-known/acme-challenge/not-active")[0] == 404
 
         exhaust(direct)

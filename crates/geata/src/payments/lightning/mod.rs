@@ -1,6 +1,8 @@
 //! x402 v2 exact/lnbtc, HTTP request binding and local upfront settlement.
 mod cashu;
+mod issuance;
 mod l402;
+mod maintenance;
 mod receiver;
 
 use anyhow::{Context, ensure};
@@ -21,13 +23,15 @@ const MAINNET: &str = "lnbtc:000000000019d6689c085ae165831e93";
 const TESTNET: &str = "lnbtc:000000000933ea01ad0ee984209779ba";
 const SPENT: TableDefinition<&str, u64> = TableDefinition::new("lightning_spent_v1");
 const SKEW: u64 = 60;
+pub(super) const QUOTE_PRUNE_GRACE: u64 = SKEW + 3600;
+pub(super) const MAX_CHALLENGE_RECORDS: u64 = 10_000;
 pub const MAX_PAYMENT_HEADER: usize = 24 * 1024;
 pub const MAX_BODY: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct LdkReceiverConfig {
     pub endpoint: String,
-    pub api_key_file: PathBuf,
+    pub macaroon_file: PathBuf,
     pub tls_cert_file: PathBuf,
     pub pay_to: String,
     pub network: String,
@@ -183,7 +187,7 @@ impl Policy {
                 asset_transfer_method: Some("bolt11".into()),
                 payment_flow: "upfront".into(),
                 request_hash: hash,
-                request_binding_profile: "http:1".into(),
+                request_binding_profile: self.binding_profile().into(),
                 request_binding_params: BindingParams {
                     headers: self.headers.clone(),
                 },
@@ -205,7 +209,7 @@ impl ReceiverConfig {
                     pair[0],
                     "mint"
                         | "endpoint"
-                        | "api_key_file"
+                        | "macaroon_file"
                         | "tls_cert_file"
                         | "pay_to"
                         | "network"
@@ -243,7 +247,7 @@ impl ReceiverConfig {
         }
         let receiver = LdkReceiverConfig {
             endpoint: required("endpoint")?.into(),
-            api_key_file: required("api_key_file")?.into(),
+            macaroon_file: required("macaroon_file")?.into(),
             tls_cert_file: required("tls_cert_file")?.into(),
             pay_to: required("pay_to")?.into(),
             network: network.into(),
@@ -269,7 +273,7 @@ impl LdkReceiverConfig {
             "ldk-server endpoint must be an HTTPS origin"
         );
         ensure!(
-            self.api_key_file.is_absolute() && self.tls_cert_file.is_absolute(),
+            self.macaroon_file.is_absolute() && self.tls_cert_file.is_absolute(),
             "receiver credential paths must be absolute"
         );
         ensure!(
@@ -290,6 +294,14 @@ impl LdkReceiverConfig {
     }
 }
 impl Policy {
+    fn binding_profile(&self) -> &'static str {
+        if self.headers.is_empty() {
+            "http:1"
+        } else {
+            "geata:http:2"
+        }
+    }
+
     fn validate_binding(&self) -> anyhow::Result<()> {
         ensure!(
             self.receiver.mint().is_none() || (self.protocols.l402 && !self.protocols.x402),
@@ -423,19 +435,14 @@ pub fn request_hash(
                     .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b)),
                 "unsupported bound header value"
             );
-            values.push(value.trim_matches([' ', '\t']));
+            values.push(value);
         }
-        let value_hash = if values.is_empty() {
-            digest(&[0])
-        } else {
-            let mut bytes = vec![1];
-            bytes.extend_from_slice(values.join(", ").as_bytes());
-            digest(&bytes)
-        };
+        // Preserve occurrence boundaries, ordering, empty values and whitespace.
+        let value_hash = digest(&serde_json::to_vec(&values)?);
         bound.push(json!({"name": name, "valueHash": value_hash}));
     }
     Ok(digest(&serde_json::to_vec(&json!({
-        "domain": "x402:exact:lnbtc:bolt11:http:1", "method": method,
+        "domain": format!("x402:exact:lnbtc:bolt11:{}", policy.binding_profile()), "method": method,
         "url": url, "bodyHash": digest(body), "headers": bound
     }))?))
 }
@@ -548,6 +555,8 @@ pub struct Lightning {
     database: Mutex<Option<Arc<Database>>>,
     // Limit invoice creation independently of free-request quotas, across reloads.
     issuance: crate::rate_limit::RateLimiter,
+    challenge_concurrency: issuance::Issuance,
+    cashu_prune_cursor: Mutex<Option<String>>,
 }
 impl Lightning {
     pub fn new(data: &Path, payments: Arc<super::Payments>) -> Self {
@@ -555,6 +564,8 @@ impl Lightning {
             path: data.join("lightning").join("settlements.redb"),
             payments,
             database: Mutex::new(None),
+            challenge_concurrency: issuance::Issuance::default(),
+            cashu_prune_cursor: Mutex::new(None),
             issuance: crate::rate_limit::RateLimiter::new(crate::rate_limit::Limit {
                 per_second: 1,
                 burst: 3,
@@ -572,8 +583,12 @@ impl Lightning {
             self.issuance.check(client).is_ok(),
             "invoice issuance rate exceeded"
         );
-        // Establish durable storage before asking anyone to pay.
-        self.database().await?;
+        let _issuance = self
+            .challenge_concurrency
+            .acquire(&policy.receiver, client)?;
+        // Check before requesting an invoice; inserts recheck atomically too.
+        let needed = u64::from(policy.protocols.l402) + u64::from(policy.receiver.mint().is_some());
+        self.check_challenge_capacity(needed).await?;
         let invoice = match &policy.receiver {
             ReceiverConfig::Ldk(node) => receiver::invoice(node, policy.amount_msat, hash).await?,
             ReceiverConfig::Cashu { mint, .. } => self.cashu_invoice(policy, mint, hash).await?,
@@ -612,6 +627,7 @@ impl Lightning {
             tx.open_table(l402::ROOTS)?;
             tx.open_table(cashu::QUOTES)?;
             tx.open_table(cashu::MINTS)?;
+            maintenance::prune(&tx, now()?)?;
             tx.commit()?;
             std::fs::File::open(parent)?.sync_all()?;
             Ok(db)
@@ -640,6 +656,10 @@ impl Lightning {
         let claimed = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let mut tx = db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
+            ensure!(
+                retain_until > now()?,
+                "settlement retention already expired"
+            );
             let claimed = {
                 let mut table = tx.open_table(SPENT)?;
                 if table.get(key.as_str())?.is_some() {
@@ -664,7 +684,7 @@ impl Lightning {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use bitcoin::{
         hashes::sha256,
@@ -672,7 +692,7 @@ mod tests {
     };
     use lightning_invoice::{InvoiceBuilder, PaymentSecret};
 
-    pub(super) fn policy() -> Policy {
+    pub(in crate::payments) fn policy() -> Policy {
         Policy {
             amount_msat: 25000,
             origin: "https://api.example.com".into(),
@@ -680,7 +700,7 @@ mod tests {
             protocols: Protocols::default(),
             receiver: ReceiverConfig::Ldk(LdkReceiverConfig {
                 endpoint: "https://localhost:3536".into(),
-                api_key_file: "/receiver/api_key".into(),
+                macaroon_file: "/receiver/geata.macaroon".into(),
                 tls_cert_file: "/receiver/tls.crt".into(),
                 pay_to: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
                 network: MAINNET.into(),
@@ -688,7 +708,7 @@ mod tests {
             }),
         }
     }
-    pub(super) fn signed(policy: &Policy, hash: &str, time: u64) -> String {
+    pub(in crate::payments) fn signed(policy: &Policy, hash: &str, time: u64) -> String {
         let mut key = [0; 32];
         key[31] = 1;
         let key = SecretKey::from_slice(&key).expect("test key");
@@ -777,6 +797,28 @@ mod tests {
     }
 
     #[test]
+    fn header_binding_preserves_occurrences_order_and_raw_values() -> anyhow::Result<()> {
+        let mut p = policy();
+        for name in ["x-operation", "cookie"] {
+            p.headers = vec![name.into()];
+            let hash = |values: &[&str]| -> anyhow::Result<String> {
+                let mut headers = http::HeaderMap::new();
+                for value in values {
+                    headers.append(name, value.parse()?);
+                }
+                request_hash(&p, "POST", "https://api.example.com/", &headers, b"")
+            };
+            assert_ne!(hash(&["a", "b"])?, hash(&["a, b"])?);
+            assert_ne!(hash(&["a", "b"])?, hash(&["b", "a"])?);
+            assert_ne!(hash(&[])?, hash(&[""])?);
+            assert_ne!(hash(&[""])?, hash(&["", ""])?);
+            assert_ne!(hash(&["a"])?, hash(&[" a "])?);
+            assert_eq!(p.binding_profile(), "geata:http:2");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn proof_checks_terms_signed_binding_preimage_network_and_expiry() -> anyhow::Result<()> {
         let p = policy();
         let hash = digest(b"request");
@@ -849,7 +891,7 @@ mod tests {
     fn receiver_block() -> &'static str {
         "lightning node {
             endpoint https://localhost:3536
-            api_key_file /receiver/api_key
+            macaroon_file /receiver/geata.macaroon
             tls_cert_file /receiver/tls.crt
             pay_to 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
             network mainnet
@@ -963,13 +1005,14 @@ mod tests {
         let block = receiver_block();
         let site = "api.example.com { respond ok rate_limit 1/s burst 1 lightning_pay 25 sat node lightning_headers none }";
         for invalid in [
+            block.replace("macaroon_file", "api_key_file"),
             block.replace("network mainnet", "network regtest"),
             block.replace("network mainnet", "network mainnet network testnet"),
             block.replace("network mainnet", ""),
             block.replace("network mainnet", "network mainnet unknown value"),
             block.replace("network mainnet", "network mainnet expiry_seconds 0"),
             block.replace("network mainnet", "network mainnet expiry_seconds 86401"),
-            block.replace("/receiver/api_key", "relative/key"),
+            block.replace("/receiver/geata.macaroon", "relative/key"),
             block.replace("https://localhost:3536", "http://localhost:3536"),
             block.replace("lightning node", "lightning invalid.name"),
             format!("{block} {block}"),

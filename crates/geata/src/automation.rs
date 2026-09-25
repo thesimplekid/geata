@@ -41,11 +41,23 @@ impl BackgroundService for Automation {
             _ = self.manage_certificates() => {},
             _ = self.manage_payouts() => {},
             _ = self.manage_cashu_deposits() => {},
+            _ = self.manage_lightning_records() => {},
         }
     }
 }
 
 impl Automation {
+    async fn manage_lightning_records(&self) {
+        loop {
+            if let Some(lightning) = &self.state.lightning
+                && lightning.prune_expired().await.is_err()
+            {
+                tracing::warn!("Lightning record cleanup deferred");
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    }
+
     async fn manage_cashu_deposits(&self) {
         loop {
             if let Some(lightning) = &self.state.lightning

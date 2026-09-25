@@ -12,7 +12,6 @@ use openssl::{
     hash::MessageDigest,
     pkey::PKey,
     rsa::Rsa,
-    sign::Signer,
     x509::{
         X509, X509NameBuilder,
         extension::{BasicConstraints, SubjectAlternativeName},
@@ -124,7 +123,7 @@ async fn receiver(
                     let count = count.clone();
                     tokio::spawn(async move {
                         assert_eq!(request.uri().path(), "/api.LightningNode/Bolt11Receive");
-                        let auth = request.headers()["x-auth"]
+                        let auth = request.headers()["macaroon"]
                             .to_str()
                             .expect("auth")
                             .to_owned();
@@ -137,19 +136,18 @@ async fn receiver(
                                 .expect("capacity");
                             bytes.extend_from_slice(&data);
                         }
-                        let (stamp, mac) = auth
-                            .strip_prefix("HMAC ")
-                            .expect("HMAC")
-                            .split_once(':')
-                            .expect("timestamp");
-                        let stamp: u64 = stamp.parse().expect("timestamp");
-                        assert!(seconds().abs_diff(stamp) < 10);
-                        let key = PKey::hmac(hex(&[99; 32]).as_bytes()).expect("key");
-                        let mut signer =
-                            Signer::new(MessageDigest::sha256(), &key).expect("signer");
-                        signer.update(&stamp.to_be_bytes()).expect("stamp");
-                        signer.update(&bytes).expect("frame");
-                        assert_eq!(mac, hex(&signer.sign_to_vec().expect("mac")));
+                        let token = ldk_server_client::macaroon::Macaroon::from_hex(&auth)
+                            .expect("macaroon");
+                        assert_eq!(token.identifier(), b"geata");
+                        assert!(token.verify_signature(&[99; 32]));
+                        let caveats = token.caveats();
+                        assert_eq!(caveats.len(), 1);
+                        let binding =
+                            ldk_server_client::macaroon::RequestBinding::parse(&caveats[0])
+                                .expect("request binding");
+                        assert_eq!(binding.method, "Bolt11Receive");
+                        assert!(binding.matches_body(&bytes));
+                        assert!(seconds().abs_diff(binding.timestamp) < 10);
                         assert_eq!(bytes[0], 0);
                         assert_eq!(
                             u32::from_be_bytes(bytes[1..5].try_into().expect("length")) as usize,
@@ -294,7 +292,12 @@ async fn admission(l402: bool) -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let (pem, cert, key) = certificate()?;
     std::fs::write(root.path().join("tls.crt"), pem)?;
-    std::fs::write(root.path().join("api_key"), [99; 32])?;
+    let token = ldk_server_client::macaroon::Macaroon::mint(&[99; 32], b"geata")
+        .map_err(anyhow::Error::msg)?;
+    std::fs::write(
+        root.path().join("geata.macaroon"),
+        format!("{}\n", token.to_hex()),
+    )?;
     let count = Arc::new(AtomicUsize::new(0));
     let (receiver_port, receiver_task) = receiver(count.clone(), cert, key).await?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -306,7 +309,7 @@ async fn admission(l402: bool) -> anyhow::Result<()> {
     let backend = std::net::TcpListener::bind("127.0.0.1:0")?;
     let backend_port = backend.local_addr()?.port();
     let backend_thread = std::thread::spawn(move || -> anyhow::Result<()> {
-        for index in 0..2 {
+        for index in 0..if l402 { 2 } else { 18 } {
             let (mut socket, _) = backend.accept()?;
             socket.set_read_timeout(Some(Duration::from_secs(10)))?;
             let mut reader = BufReader::new(socket.try_clone()?);
@@ -330,7 +333,13 @@ async fn admission(l402: bool) -> anyhow::Result<()> {
             let length: usize = header(&headers, "content-length").unwrap_or("0").parse()?;
             let mut body = vec![0; length];
             reader.read_exact(&mut body)?;
-            if index == 1 {
+            if !l402 && index < 16 {
+                assert_eq!(
+                    header(&headers, "authorization"),
+                    Some("Bearer backend-token")
+                );
+            }
+            if index == if l402 { 1 } else { 17 } {
                 assert_eq!(body, b"body", "paid body must reach the backend unchanged");
             }
             socket.write_all(
@@ -343,9 +352,10 @@ async fn admission(l402: bool) -> anyhow::Result<()> {
     std::fs::write(
         &config,
         format!(
-            "lightning node {{ endpoint https://localhost:{receiver_port} api_key_file {} tls_cert_file {} pay_to 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 network mainnet }}\nhttp://localhost {{\nrate_limit 1/s burst 1\npay 2 sat https://mint.example.com\nlightning_pay 25 sat node\nlightning_headers {}\n{}\nlightning_origin http://localhost:{port}\nreverse_proxy 127.0.0.1:{backend_port}\n}}",
-            root.path().join("api_key").display(),
+            "lightning node {{ endpoint https://localhost:{receiver_port} macaroon_file {} tls_cert_file {} pay_to 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 network mainnet }}\nhttp://localhost {{\nrate_limit 1/s burst {}\npay 2 sat https://mint.example.com\nlightning_pay 25 sat node\nlightning_headers {}\n{}\nlightning_origin http://localhost:{port}\nreverse_proxy 127.0.0.1:{backend_port}\n}}",
+            root.path().join("geata.macaroon").display(),
             root.path().join("tls.crt").display(),
+            if l402 { 1 } else { 17 },
             if l402 {
                 "content-type"
             } else {
@@ -386,6 +396,24 @@ async fn admission(l402: bool) -> anyhow::Result<()> {
         anyhow::bail!("geata startup timed out")
     };
     let process = start()?;
+    if !l402 {
+        // Backend authorization on x402-only sites must not spend the much
+        // smaller payment-verification allowance, and must reach the backend.
+        for _ in 0..16 {
+            assert_eq!(
+                request(
+                    port,
+                    "GET",
+                    "/",
+                    None,
+                    "Authorization: Bearer backend-token\r\n",
+                    b""
+                )?
+                .0,
+                200
+            );
+        }
+    }
     assert_eq!(request(port, "GET", "/", None, "", b"")?.0, 200);
     let (status, challenge) = request(
         port,
@@ -495,6 +523,7 @@ async fn admission(l402: bool) -> anyhow::Result<()> {
     // Restart into an always-paid Lightning-only handler, preserving the replay database.
     let updated = std::fs::read_to_string(&config)?
         .replace("rate_limit 1/s burst 1\n", "")
+        .replace("rate_limit 1/s burst 17\n", "")
         .replace("pay 2 sat https://mint.example.com\n", "")
         .replace(
             &format!("reverse_proxy 127.0.0.1:{backend_port}"),

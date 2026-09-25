@@ -173,6 +173,7 @@ impl Lightning {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut tx = database.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
+            super::maintenance::check_capacity(&tx, 1)?;
             {
                 let mut table = tx.open_table(ROOTS)?;
                 ensure!(

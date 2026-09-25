@@ -2,6 +2,8 @@ mod acme_http;
 mod automation;
 mod certificates;
 mod config;
+mod connections;
+mod logging;
 mod payments;
 mod proxy;
 mod rate_limit;
@@ -126,7 +128,13 @@ fn main() -> anyhow::Result<()> {
                 || !metadata.target().starts_with("pingora_proxy"))
     });
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(requested.and(safe_dependencies)))
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(
+                requested
+                    .and(safe_dependencies)
+                    .and(logging::ListenerErrorFilter::default()),
+            ),
+        )
         .init();
     match Cli::parse().command {
         Command::Wallet {

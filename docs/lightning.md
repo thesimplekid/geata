@@ -6,9 +6,9 @@ with incoming Lightning liquidity. Geata creates invoices through its authentica
 TLS gRPC API. Funds stay on that node. L402 can instead receive through a Cashu
 mint, keeping the proceeds in Geata's Cashu wallet without your own node.
 
-The adapter targets `api.LightningNode/Bolt11Receive` with the description-hash
+The `ldk-server-client` adapter targets `api.LightningNode/Bolt11Receive` with the description-hash
 variant of `Bolt11InvoiceDescription`, as defined at LDK Server commit
-[`db345786`](https://github.com/lightningdevkit/ldk-server/tree/db3457867ef20fdc0523d882c1585dbdb3e41760).
+[`08316de`](https://github.com/lightningdevkit/ldk-server/tree/08316de8795a759eee08dc3873d32f980fbd0fe0).
 Older versions without this API are unsupported. Upstream currently describes
 LDK Server as experimental and not ready for production use.
 
@@ -19,7 +19,7 @@ Define a named receiver and reference it from each paid site in the Geatafile:
 ```caddyfile
 lightning my_node {
     endpoint https://localhost:3536
-    api_key_file /var/lib/ldk-server/bitcoin/api_key
+    macaroon_file /var/lib/ldk-server/bitcoin/macaroons/geata.macaroon
     tls_cert_file /var/lib/ldk-server/tls.crt
     network mainnet
     pay_to YOUR_66_CHARACTER_COMPRESSED_NODE_PUBLIC_KEY
@@ -34,6 +34,17 @@ example.com {
     reverse_proxy localhost:3000
 }
 ```
+
+Create a dedicated token on the upgraded LDK host:
+
+```sh
+ldk create-macaroon geata --permissions invoices:create
+```
+
+Install the returned JSON `.token` as a private hex-encoded macaroon file
+(root-owned, mode `0600`, passed through systemd `LoadCredential` when applicable).
+Geata only needs `invoices:create`; do not give it the admin or LNURL token.
+The client binds authentication to each invoice request automatically.
 
 Use the actual node ID for `pay_to` and paths from your LDK Server deployment.
 The API key file contains LDK Server's **32 raw bytes**, not a hex string. Give
@@ -235,8 +246,16 @@ before forwarding, and payment-enabled responses carry `Cache-Control: no-store`
 
 ## Request binding and deployment requirements
 
-This implements the `http:1` profile of
+Sites without bound headers use the `http:1` profile of
 [x402 exact Lightning](https://github.com/x402-foundation/x402/blob/276e7cdce1620142139bf1aa6995fdad6a76cd88/specs/schemes/exact/scheme_exact_lnbtc.md).
+Sites with bound headers advertise Geata's `geata:http:2` profile. Each header's
+`valueHash` hashes the compact JSON array of its ASCII values, in occurrence
+order, without trimming. Missing headers encode as `[]`; an empty occurrence
+encodes as `[""]`. Duplicate fields differ from a single comma-containing field.
+The binding domain is `x402:exact:lnbtc:bolt11:geata:http:2`; the rest of the
+binding object is unchanged. Clients must support this profile and obtain fresh
+challenges after upgrading; credentials bound with the former encoding are not
+accepted for sites with bound headers.
 The signed description hash binds the method, complete URL with query order
 preserved, body bytes, and configured headers. A retry must preserve those values.
 Unused invoices for identical requests and terms are accepted without maintaining
@@ -264,17 +283,55 @@ for that same receiver: this version has no shared multi-instance replay store.
 
 The private replay database is `<data-dir>/lightning/settlements.redb`, separate
 from Cashu storage. Back it up with the rest of Geata's data while stopped.
-Never delete it to reset limits. Used payment hashes are retained indefinitely,
-including across config reloads and restarts. L402 root keys are also stored privately
-in this database and retained indefinitely. Losing it invalidates outstanding L402
-credentials and loses x402 replay protection. Protect backups as payment secrets.
+Never delete it to reset limits. Used payment hashes and private L402 root keys
+survive configuration reloads and restarts until their retention deadlines.
+Losing this database invalidates outstanding L402 credentials and loses x402
+replay protection. Protect backups as payment secrets.
 LDK Server's own backups and channel operations remain separate responsibilities.
 
 `cargo test --test lightning` exercises the binary against a local TLS/gRPC
-receiver fixture with signed invoices and HMAC authentication. Unit tests check
+receiver fixture with signed invoices and request-bound macaroon authentication. Unit tests check
 the specification's HTTP binding vectors, proof validation, concurrent settlement,
 and restart persistence. `cargo test --test cashu` also exercises mint-backed L402,
 lost mint responses, deposit recovery, and a shared Cashu balance. These tests do
 not operate a live Lightning channel.
+
+
+## Payment record retention
+
+Expired L402 roots and replay barriers are pruned when the payment database
+opens and every 30 seconds, independently of mint recovery. Root expiration is
+exclusive; replay barriers retain the existing clock-skew and one-hour safety
+window. Cleanup never evicts live credentials or live replay barriers.
+
+At most 10,000 outstanding records (L402 roots plus Cashu quote associations)
+are allowed per process database. Cashu L402 issuance needs two slots. Issuance
+fails closed at capacity, while existing payments can still settle. Each mint
+wallet also caps stored quotes at 10,000, including quotes left by cancelled or
+failed issuance. These limits survive restarts through the stored record counts.
+
+Invoice RPCs allow up to 8 concurrent requests per receiver endpoint or mint,
+with at most 2 from one client identity. Across receivers, the process allows
+64 concurrent requests and at most 8 per client. IPv6 identities use /64
+prefixes. Saturated budgets reject immediately without queuing. Receiver aliases
+and credential rotations share the endpoint's budget, which is released on
+completion or cancellation. Cashu wallet mutations retain their per-mint
+serialization; a busy mint does not hold a process-wide issuance lock. Database
+insertion still checks the durable record cap atomically.
+
+Cashu recovery runs at startup and every 30 seconds after each pass. Cleanup
+rotates through at most 32 associations per pass. Once the invoice's validity,
+clock-skew grace, and one-hour retention window have elapsed, a quote is removed
+when durable wallet history proves collection, or a fresh mint status response
+confirms it is unpaid with zero paid/issued amounts and matching quote terms.
+Unpaid cleanup also requires the mint quote's own expiry plus the same grace
+window to have elapsed. Paid, pending, mismatched, unreachable, or otherwise
+uncertain records remain recoverable and count against capacity. Retirement is
+journaled before deleting the wallet quote and association, so a restart can
+finish interrupted cleanup. Orphan wallet quotes from cancelled issuance are
+also checked during recovery. Financial transaction history is retained.
+
+Pruning permits database pages to be reused; it does not promise to shrink the
+files immediately. Back up payment storage before any offline compaction.
 
 Back to [Geata](../README.md).

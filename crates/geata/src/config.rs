@@ -68,11 +68,12 @@ impl Default for RequestControls {
 pub struct Capacity {
     pub max: u32,
     pub ipv6_prefix: u8,
-    per_client: u32,
+    pub(crate) per_client: u32,
     permits: Arc<Semaphore>,
     clients: Arc<Mutex<HashMap<IpAddr, u32>>>,
 }
 
+#[derive(Debug)]
 pub struct CapacityPermit {
     client: IpAddr,
     clients: Arc<Mutex<HashMap<IpAddr, u32>>>,
@@ -80,7 +81,7 @@ pub struct CapacityPermit {
 }
 
 impl Capacity {
-    fn new(max: u32) -> Self {
+    pub(crate) fn new(max: u32) -> Self {
         Self {
             max,
             ipv6_prefix: 64,

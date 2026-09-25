@@ -14,10 +14,9 @@ path = "src/main.rs"
 base64.workspace = true
 bitcoin.workspace = true
 lightning-invoice.workspace = true
+ldk-server-client.workspace = true
 macaroon.workspace = true
-prost.workspace = true
 http-body-util.workspace = true
-rustls-pemfile.workspace = true
 cdk.workspace = true
 cdk-sqlite.workspace = true
 redb.workspace = true
@@ -41,10 +40,14 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-log.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+prost.workspace = true
+log.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 h2.workspace = true
 tokio-rustls.workspace = true
 nostr-sdk.workspace = true
